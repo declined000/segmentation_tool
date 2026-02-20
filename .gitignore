@@ -1,0 +1,20 @@
+.venv*/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Data / large binaries
+*.tif
+*.tiff
+*.mp4
+*.png
+*.jpg
+*.jpeg
+*.pdf
+
+# Outputs
+results/
+
+# Cursor project cache
+.cursor/
+
