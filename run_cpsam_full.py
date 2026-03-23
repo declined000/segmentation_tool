@@ -134,17 +134,23 @@ if __name__ == "__main__":
         print(f"    {len(pts)} detections kept")
 
         print("  Tracking ...")
-        tracks = _track_centroids(masks_filt, tr=tr)
-        n_tracks = tracks["particle"].nunique() if not tracks.empty else 0
-        print(f"    {n_tracks} tracks")
+        tracks = pd.DataFrame()
+        lineage = pd.DataFrame()
+        try:
+            tracks = _track_centroids(masks_filt, tr=tr)
+            n_tracks = tracks["particle"].nunique() if not tracks.empty else 0
+            print(f"    {n_tracks} tracks")
 
-        if not tracks.empty:
-            tracks = tracks.sort_values(["particle", "frame"]).copy()
-            tracks[["dx", "dy"]] = tracks.groupby("particle")[["x", "y"]].diff()
+            if not tracks.empty:
+                tracks = tracks.sort_values(["particle", "frame"]).copy()
+                tracks[["dx", "dy"]] = tracks.groupby("particle")[["x", "y"]].diff()
 
-        lineage = _build_lineage_df(tracks, file_meta)
-        n_div = int((lineage["n_children"] >= 2).sum()) if not lineage.empty else 0
-        print(f"    {n_div} division events")
+            lineage = _build_lineage_df(tracks, file_meta)
+            n_div = int((lineage["n_children"] >= 2).sum()) if not lineage.empty else 0
+            print(f"    {n_div} division events")
+        except Exception as e:
+            print(f"    WARNING: Tracking failed ({e})")
+            print(f"    Segmentation + masks still saved. Run tracking locally.")
 
         per_cell = _per_cell_metrics(tracks, file_meta)
 
@@ -165,8 +171,11 @@ if __name__ == "__main__":
         print("  Exporting segmentation overlay video ...")
         export_segmentation_overlay_mp4(out_dir, tif_path, masks_filt, ef_on_frame=None)
 
-        print("  Exporting tracking overlay video ...")
-        export_tracking_overlay_mp4(out_dir, tif_path, masks_filt, pts, tracks, ef_on_frame=None)
+        if not tracks.empty:
+            print("  Exporting tracking overlay video ...")
+            export_tracking_overlay_mp4(out_dir, tif_path, masks_filt, pts, tracks, ef_on_frame=None)
+        else:
+            print("  Skipping tracking overlay (no tracks).")
 
         elapsed = time.time() - t0
         print(f"  Done in {elapsed:.0f}s\n")
