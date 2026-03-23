@@ -11,8 +11,6 @@ import tifffile as tf
 from skimage.measure import regionprops_table
 from skimage.segmentation import relabel_sequential
 
-import trackpy as tp
-
 from .types import (
     MetadataParams,
     OutputOptions,
@@ -45,7 +43,20 @@ def _run_cellpose_on_stack(
     nT = int(mm.shape[0])
     T = nT if max_frames is None else min(nT, int(max_frames))
 
-    if seg.denoise:
+    import torch as _torch
+    _can_bf16 = (
+        seg.use_gpu
+        and _torch.cuda.is_available()
+        and _torch.cuda.get_device_capability()[0] >= 8  # Ampere+
+    )
+
+    if str(seg.model_type) == "cpsam":
+        model = models.CellposeModel(
+            gpu=bool(seg.use_gpu),
+            pretrained_model="cpsam",
+            use_bfloat16=_can_bf16,
+        )
+    elif seg.denoise:
         from cellpose import denoise
         restore_type = f"denoise_{seg.model_type}"
         model = denoise.CellposeDenoiseModel(
@@ -54,14 +65,16 @@ def _run_cellpose_on_stack(
             restore_type=restore_type,
         )
     else:
-        model = models.Cellpose(gpu=bool(seg.use_gpu), model_type=str(seg.model_type))
+        model = models.CellposeModel(
+            gpu=bool(seg.use_gpu),
+            pretrained_model=str(seg.model_type),
+        )
 
     masks: list[np.ndarray] = []
     for t in range(T):
         img = mm[t]
         result = model.eval(
             img,
-            channels=[0, 0],
             diameter=None if seg.diameter_px is None else float(seg.diameter_px),
             flow_threshold=float(seg.flow_threshold),
             cellprob_threshold=float(seg.cellprob_threshold),
@@ -149,38 +162,129 @@ def _qc_centroids_from_masks(
     return pts, masks_filt
 
 
-def _track_centroids(
-    pts: pd.DataFrame,
-    tr: TrackingParams,
-) -> pd.DataFrame:
-    if pts.empty:
-        return pd.DataFrame()
+def _make_btrack_config(tr: TrackingParams):
+    """Build a btrack TrackerConfig tuned for 2-D cell tracking."""
+    from btrack.config import TrackerConfig, MotionModel, HypothesisModel
 
-    df_track = pts[["frame", "x", "y"]].copy()
-    linked = tp.link_df(
-        df_track,
-        search_range=float(tr.search_range_px),
-        memory=int(tr.memory),
+    sr = float(tr.search_range_px)
+
+    # Constant-velocity Kalman filter in 3-D (btrack always uses x, y, z;
+    # for 2-D data z stays ≈ 0).
+    motion = MotionModel(
+        measurements=3,
+        states=6,
+        A=[[1, 0, 0, 1, 0, 0],
+           [0, 1, 0, 0, 1, 0],
+           [0, 0, 1, 0, 0, 1],
+           [0, 0, 0, 1, 0, 0],
+           [0, 0, 0, 0, 1, 0],
+           [0, 0, 0, 0, 0, 1]],
+        H=[[1, 0, 0, 0, 0, 0],
+           [0, 1, 0, 0, 0, 0],
+           [0, 0, 1, 0, 0, 0]],
+        P=[[150, 0, 0, 0, 0, 0],
+           [0, 150, 0, 0, 0, 0],
+           [0, 0, 150, 0, 0, 0],
+           [0, 0, 0, 15, 0, 0],
+           [0, 0, 0, 0, 15, 0],
+           [0, 0, 0, 0, 0, 15]],
+        R=[[5, 0, 0],
+           [0, 5, 0],
+           [0, 0, 5]],
+        G=[[15, 15, 15, 10, 10, 10]],
+        dt=1.0,
+        accuracy=7.5,
+        max_lost=int(tr.memory),
+        prob_not_assign=0.1,
+        name="cell_motion",
     )
 
-    linked = linked.sort_values(["particle", "frame"]).copy()
-    linked["step"] = linked.groupby("particle")["frame"].diff()
-    linked["dx_raw"] = linked.groupby("particle")["x"].diff()
-    linked["dy_raw"] = linked.groupby("particle")["y"].diff()
-    linked["jump_px"] = np.hypot(linked["dx_raw"], linked["dy_raw"])
+    # Global optimizer: strongly penalise division (lambda_branch) so real
+    # divisions must be unambiguous; keep linking cheap (lambda_link).
+    hypothesis = HypothesisModel(
+        hypotheses=[
+            "P_FP", "P_init", "P_term", "P_link", "P_branch", "P_dead",
+        ],
+        lambda_time=5.0,
+        lambda_dist=5.0,
+        lambda_link=5.0,
+        lambda_branch=50.0,
+        eta=1e-10,
+        theta_dist=sr,
+        theta_time=float(int(tr.memory) + 2),
+        dist_thresh=sr,
+        time_thresh=int(tr.memory) + 1,
+        apop_thresh=5,
+        segmentation_miss_rate=0.1,
+        apoptosis_rate=0.001,
+        relax=True,
+        name="cell_hypothesis",
+    )
 
-    jump_max = float(tr.jump_max_factor) * float(tr.search_range_px)
-    linked["break"] = (linked["step"] != 1) | (linked["jump_px"] > jump_max)
-    linked["segment"] = linked.groupby("particle")["break"].cumsum().fillna(0).astype(int)
+    return TrackerConfig(
+        motion_model=motion,
+        hypothesis_model=hypothesis,
+        max_search_radius=max(int(sr), 25),
+    )
 
-    linked["particle"] = (linked["particle"].astype(int) * 10000 + linked["segment"]).astype(int)
-    linked.drop(columns=["segment"], inplace=True)
 
-    counts = linked.groupby("particle").size()
+def _track_centroids(
+    masks_filt: np.ndarray,
+    tr: TrackingParams,
+) -> pd.DataFrame:
+    """Track cells using btrack with division / lineage support.
+
+    Returns a DataFrame with columns:
+      frame, x, y, particle, parent, generation, fate
+    """
+    import btrack
+    from btrack.io import segmentation_to_objects
+
+    if int(masks_filt.max()) == 0:
+        return pd.DataFrame()
+
+    objects = segmentation_to_objects(masks_filt, properties=("area",))
+    if len(objects) == 0:
+        return pd.DataFrame()
+
+    H, W = int(masks_filt.shape[1]), int(masks_filt.shape[2])
+    cfg = _make_btrack_config(tr)
+
+    with btrack.BayesianTracker() as tracker:
+        tracker.configure(cfg)
+        tracker.volume = ((0, H), (0, W), (-1, 1))
+        tracker.append(objects)
+        tracker.track(step_size=100)
+        tracker.optimize()
+        btrack_tracks = tracker.tracks
+
+    rows: list[dict] = []
+    for trk in btrack_tracks:
+        pid = trk.parent
+        gen = getattr(trk, "generation", 0) or 0
+        fate_str = trk.fate.name if trk.fate is not None else "UNDEFINED"
+        for i in range(len(trk.t)):
+            rows.append({
+                "frame": int(trk.t[i]),
+                "x": float(trk.x[i]),
+                "y": float(trk.y[i]),
+                "particle": int(trk.ID),
+                "parent": int(pid) if pid is not None else None,
+                "generation": int(gen),
+                "fate": fate_str,
+            })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    df = df.sort_values(["particle", "frame"]).copy()
+
+    counts = df.groupby("particle").size()
     keep = counts[counts >= int(tr.min_track_len)].index
-    linked = linked[linked["particle"].isin(keep)].copy()
+    df = df[df["particle"].isin(keep)].copy()
 
-    return linked
+    return df
 
 
 def _drift_correct(tracks: pd.DataFrame) -> pd.DataFrame:
@@ -267,6 +371,64 @@ def _per_cell_metrics(tracks: pd.DataFrame, meta: MetadataParams) -> pd.DataFram
     return out
 
 
+def _build_lineage_df(
+    tracks: pd.DataFrame,
+    meta: MetadataParams,
+) -> pd.DataFrame:
+    """Build a per-track lineage summary (one row per track)."""
+    if tracks.empty or "parent" not in tracks.columns:
+        return pd.DataFrame()
+
+    g = tracks.groupby("particle", sort=False)
+
+    out = pd.DataFrame({
+        "n_frames": g.size(),
+        "start_frame": g["frame"].min(),
+        "end_frame": g["frame"].max(),
+        "generation": g["generation"].first(),
+        "parent_id": g["parent"].first(),
+        "fate": g["fate"].first() if "fate" in tracks.columns else "UNDEFINED",
+    })
+    out.index.name = "track_id"
+
+    has_parent = tracks[tracks["parent"].notna()].copy()
+    if not has_parent.empty:
+        children_map = (
+            has_parent.groupby("parent")["particle"]
+            .apply(lambda s: sorted(s.unique().tolist()))
+            .to_dict()
+        )
+    else:
+        children_map = {}
+
+    out["children"] = [children_map.get(tid, []) for tid in out.index]
+    out["n_children"] = out["children"].apply(len)
+
+    # Division angle: angle between daughter pair relative to EF axis
+    dividers = out[out["n_children"] >= 2]
+    angles: dict[int, float] = {}
+    for tid, row in dividers.iterrows():
+        kids = row["children"]
+        if len(kids) < 2:
+            continue
+        c1 = tracks[tracks["particle"] == kids[0]]
+        c2 = tracks[tracks["particle"] == kids[1]]
+        if c1.empty or c2.empty:
+            continue
+        p1, p2 = c1.iloc[0], c2.iloc[0]
+        dx, dy = float(p2["x"] - p1["x"]), float(p2["y"] - p1["y"])
+        angle = np.degrees(np.arctan2(dy, dx))
+        if meta.ef_axis == "y":
+            angle -= 90.0
+        angles[tid] = angle  # type: ignore[arg-type]
+
+    out["division_angle_deg"] = pd.Series(angles, dtype=float)
+    out["children"] = out["children"].apply(
+        lambda lst: ",".join(str(x) for x in lst) if lst else ""
+    )
+    return out
+
+
 def _per_frame_metrics(
     pts: pd.DataFrame,
     masks_shape: tuple[int, int, int],
@@ -294,9 +456,13 @@ def _per_frame_metrics(
     return base
 
 
-def _summary(tracks: pd.DataFrame, pts: pd.DataFrame, masks: np.ndarray) -> Summary:
+def _summary(
+    tracks: pd.DataFrame,
+    pts: pd.DataFrame,
+    masks: np.ndarray,
+    lineage: pd.DataFrame | None = None,
+) -> Summary:
     n_frames = int(masks.shape[0])
-    # total detections kept across frames (after QC)
     n_cells = int(pts.shape[0]) if pts is not None and not pts.empty else 0
     n_tracks = int(tracks["particle"].nunique()) if (tracks is not None and not tracks.empty) else 0
 
@@ -306,11 +472,16 @@ def _summary(tracks: pd.DataFrame, pts: pd.DataFrame, masks: np.ndarray) -> Summ
     else:
         mean_track_len = None
 
+    n_div: int | None = None
+    if lineage is not None and not lineage.empty and "n_children" in lineage.columns:
+        n_div = int((lineage["n_children"] >= 2).sum())
+
     return Summary(
         n_frames=n_frames,
         n_cells=n_cells,
         n_tracks=n_tracks,
         mean_track_len=mean_track_len,
+        n_divisions=n_div,
     )
 
 
@@ -324,7 +495,7 @@ def run_single_movie(
 ) -> SingleRunResult:
     masks = _run_cellpose_on_stack(movie_path, seg=seg, max_frames=max_frames)
     pts, masks_filt = _qc_centroids_from_masks(masks, qc=qc)
-    tracks = _track_centroids(pts, tr=tr)
+    tracks = _track_centroids(masks_filt, tr=tr)
 
     if not tracks.empty and tr.apply_drift_correction:
         tracks = _drift_correct(tracks)
@@ -332,6 +503,7 @@ def run_single_movie(
         tracks = tracks.sort_values(["particle", "frame"]).copy()
         tracks[["dx", "dy"]] = tracks.groupby("particle")[["x", "y"]].diff()
 
+    lineage = _build_lineage_df(tracks, meta=meta)
     per_frame = _per_frame_metrics(pts, masks_filt.shape, meta=meta)
     per_cell = _per_cell_metrics(tracks, meta=meta)
 
@@ -342,6 +514,7 @@ def run_single_movie(
         tracks=tracks,
         per_frame=per_frame,
         per_cell=per_cell,
+        lineage=lineage,
     )
 
 
@@ -421,7 +594,7 @@ def run_and_export(
             segmentation_overlay_mp4=seg_mp4,
             tracking_overlay_mp4=track_mp4,
         )
-        summ = _summary(res.tracks, res.pts, res.masks_filt)
+        summ = _summary(res.tracks, res.pts, res.masks_filt, res.lineage)
 
         return RunOutput(
             mode="single",
@@ -493,8 +666,8 @@ def run_and_export(
         exp_ctrl = exported_with(exp_ctrl, params_json=params_json)
         exp_ef = exported_with(exp_ef, params_json=params_json)
 
-        summ_ctrl = _summary(pair.ctrl.tracks, pair.ctrl.pts, pair.ctrl.masks_filt)
-        summ_ef = _summary(pair.ef.tracks, pair.ef.pts, pair.ef.masks_filt)
+        summ_ctrl = _summary(pair.ctrl.tracks, pair.ctrl.pts, pair.ctrl.masks_filt, pair.ctrl.lineage)
+        summ_ef = _summary(pair.ef.tracks, pair.ef.pts, pair.ef.masks_filt, pair.ef.lineage)
 
         # Pair-level metrics reported from EF only (if µm conversion available)
         if meta.pixels_per_um is not None and not pair.ef.tracks.empty:

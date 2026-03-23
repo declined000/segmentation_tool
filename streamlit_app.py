@@ -91,9 +91,9 @@ HELP = {
     # Segmentation
     "model_type": (
         "Cellpose model.\n\n"
-        "- **cyto2**: whole cells (phase contrast / brightfield)\n"
-        "- **nuclei**: fluorescent nuclei\n\n"
-        "For your movies: **cyto2**."
+        "- **cyto2**: larger cells (corneal epithelial, microglia)\n"
+        "- **nuclei**: small round cells (neutrophils) or fluorescent nuclei\n\n"
+        "Choose based on your cell type."
     ),
     "diameter_auto": (
         "If enabled, Cellpose estimates cell size automatically.\n\n"
@@ -189,13 +189,6 @@ HELP = {
         "If you lose real but short-lived cells → decrease.\n\n"
         "Safe default for ~37 frames: **10**."
     ),
-    "jump_factor": (
-        "Cuts tracks when they make an unrealistic jump.\n\n"
-        "Higher = allow bigger jumps.\n"
-        "Lower = stricter (can reduce identity swaps).\n\n"
-        "Safe default: **2.5**."
-    ),
-
     # Outputs
     "export_tracks": "Export `tracks.csv` (per-frame tracking table). Usually useful.",
     "export_per_cell": "Export `per_cell.csv` (one row per tracked cell). Great for electrotaxis summaries.",
@@ -212,14 +205,20 @@ HELP = {
         "Export `per_step_velocity.csv` (advanced).\n\n"
         "Only needed if someone wants per-step directed velocity analysis."
     ),
+    "export_lineage": (
+        "Export `lineage.csv` (one row per tracked cell).\n\n"
+        "Contains parent/children IDs, generation depth, division angle "
+        "relative to the EF axis, and cell fate (divide, terminate, etc.).\n\n"
+        "Useful for analyzing cell division events."
+    ),
     "open_napari_qc": (
         "Enable the Napari QC tools in this app.\n\n"
         "After a run, use **Launch Napari Now** to open the interactive viewer."
     ),
     "cell_preset": (
         "Pre-fill segmentation, QC, and tracking settings for common cell types.\n\n"
-        "- **Elongated (corneal epithelial)**: default settings, tuned for medium elongated cells.\n"
-        "- **Round / unpolarized**: looser shape filters for round cells that haven't polarized yet.\n"
+        "- **Corneal epithelial**: diameter ~26 um, permissive shape filters.\n"
+        "- **Neutrophils**: small fast cells. Use with **nuclei** model + **Auto diameter** for best results.\n"
         "- **Large (e.g. microglia)**: bigger diameter + area range + search range.\n"
         "- **Custom**: start from current values and tune manually.\n\n"
         "After selecting a preset, use **Preview** to verify the settings look right."
@@ -227,25 +226,25 @@ HELP = {
 }
 
 CELL_PRESETS = {
-    "Elongated (corneal epithelial)": {
-        "p_diameter_px": 30.0,
-        "p_min_area": 200,
-        "p_max_area": 6000,
-        "p_border_px": 8,
-        "p_min_solidity": 0.80,
-        "p_min_eccentricity": 0.15,
-        "p_max_circularity": 0.90,
-        "p_search_range": 20.0,
-        "p_memory": 1,
-    },
-    "Round / unpolarized": {
+    "Corneal epithelial": {
         "p_diameter_px": 30.0,
         "p_min_area": 400,
-        "p_max_area": 6000,
+        "p_max_area": 8000,
         "p_border_px": 8,
         "p_min_solidity": 0.80,
         "p_min_eccentricity": 0.0,
-        "p_max_circularity": 0.98,
+        "p_max_circularity": 0.99,
+        "p_search_range": 20.0,
+        "p_memory": 2,
+    },
+    "Neutrophils": {
+        "p_diameter_px": 30.0,
+        "p_min_area": 20,
+        "p_max_area": 2000,
+        "p_border_px": 5,
+        "p_min_solidity": 0.85,
+        "p_min_eccentricity": 0.0,
+        "p_max_circularity": 0.99,
         "p_search_range": 20.0,
         "p_memory": 2,
     },
@@ -256,7 +255,7 @@ CELL_PRESETS = {
         "p_border_px": 15,
         "p_min_solidity": 0.70,
         "p_min_eccentricity": 0.0,
-        "p_max_circularity": 0.98,
+        "p_max_circularity": 0.99,
         "p_search_range": 30.0,
         "p_memory": 2,
     },
@@ -298,6 +297,7 @@ def _summary_box(title: str, summary):
             "#detections_kept": summary.n_cells,
             "#tracks": summary.n_tracks,
             "mean_track_len": summary.mean_track_len,
+            "#divisions": summary.n_divisions,
             "mean_directed_velocity_um_per_min": summary.mean_directed_velocity_um_per_min,
             "mean_directedness": summary.mean_directedness,
         }
@@ -670,6 +670,22 @@ with st.sidebar:
 
     st.divider()
     st.markdown("<div class='sb-section'><span>🔬</span>Cell type preset</div>", unsafe_allow_html=True)
+
+    _WIDGET_DEFAULTS = {
+        "p_diameter_px": 30.0,
+        "p_min_area": 400,
+        "p_max_area": 8000,
+        "p_border_px": 8,
+        "p_min_solidity": 0.80,
+        "p_min_eccentricity": 0.0,
+        "p_max_circularity": 0.99,
+        "p_search_range": 20.0,
+        "p_memory": 2,
+    }
+    for _k, _v in _WIDGET_DEFAULTS.items():
+        if _k not in st.session_state:
+            st.session_state[_k] = _v
+
     _preset_name = st.selectbox(
         "Cell type",
         list(CELL_PRESETS.keys()),
@@ -692,14 +708,14 @@ with st.sidebar:
         model_type = st.selectbox("Model", ["cyto2", "nuclei"], index=0, help=HELP["model_type"])
         diameter_auto = st.checkbox("Auto diameter", value=False, help=HELP["diameter_auto"])
         diameter_px = None if diameter_auto else float(
-            st.number_input("Diameter (px)", min_value=5.0, value=30.0, step=1.0, help=HELP["diameter_px"], key="p_diameter_px")
+            st.number_input("Diameter (px)", min_value=5.0, step=1.0, help=HELP["diameter_px"], key="p_diameter_px")
         )
         cellprob_thr = float(
             st.slider(
                 "Cellprob threshold",
                 min_value=-6.0,
                 max_value=6.0,
-                value=0.0,
+                value=0.5,
                 step=0.1,
                 help=HELP["cellprob_thr"],
             )
@@ -725,20 +741,19 @@ with st.sidebar:
             "and lower **Min eccentricity** to 0. "
             "If many real cells are missing, try raising **Min area** to filter debris instead."
         )
-        min_area = int(st.number_input("Min area (px²)", min_value=0, value=200, step=50, help=HELP["min_area"], key="p_min_area"))
-        max_area = int(st.number_input("Max area (px²)", min_value=0, value=6000, step=200, help=HELP["max_area"], key="p_max_area"))
+        min_area = int(st.number_input("Min area (px²)", min_value=0, step=50, help=HELP["min_area"], key="p_min_area"))
+        max_area = int(st.number_input("Max area (px²)", min_value=0, step=200, help=HELP["max_area"], key="p_max_area"))
         border_px = int(
-            st.number_input("Border exclusion (px)", min_value=0, value=8, step=1, help=HELP["border_px"], key="p_border_px")
+            st.number_input("Border exclusion (px)", min_value=0, step=1, help=HELP["border_px"], key="p_border_px")
         )
         min_solidity = float(
-            st.slider("Min solidity", min_value=0.0, max_value=1.0, value=0.80, step=0.01, help=HELP["min_solidity"], key="p_min_solidity")
+            st.slider("Min solidity", min_value=0.0, max_value=1.0, step=0.01, help=HELP["min_solidity"], key="p_min_solidity")
         )
         min_eccentricity = float(
             st.slider(
                 "Min eccentricity",
                 min_value=0.0,
                 max_value=1.0,
-                value=0.15,
                 step=0.01,
                 help=HELP["min_eccentricity"],
                 key="p_min_eccentricity",
@@ -749,7 +764,6 @@ with st.sidebar:
                 "Max circularity",
                 min_value=0.0,
                 max_value=1.0,
-                value=0.90,
                 step=0.01,
                 help=HELP["max_circularity"],
                 key="p_max_circularity",
@@ -758,19 +772,16 @@ with st.sidebar:
 
     with st.expander("Tracking", expanded=False):
         st.caption(
-            "Controls how cells are linked across frames. "
+            "Uses Bayesian tracking (btrack) with automatic cell division detection. "
             "If larger/faster cells lose their tracks, increase **Search range**. "
             "If cells flicker in and out of detection, increase **Memory** to 2-3."
         )
         search_range = float(
-            st.number_input("Search range (px)", min_value=1.0, value=20.0, step=1.0, help=HELP["search_range"], key="p_search_range")
+            st.number_input("Search range (px)", min_value=1.0, step=1.0, help=HELP["search_range"], key="p_search_range")
         )
-        memory = int(st.number_input("Memory (frames)", min_value=0, value=1, step=1, help=HELP["memory"], key="p_memory"))
+        memory = int(st.number_input("Memory (frames)", min_value=0, step=1, help=HELP["memory"], key="p_memory"))
         min_track_len = int(
             st.number_input("Min track length", min_value=1, value=10, step=1, help=HELP["min_track_len"])
-        )
-        jump_factor = float(
-            st.number_input("Jump max factor", min_value=1.0, value=2.5, step=0.1, help=HELP["jump_factor"])
         )
         apply_drift = st.checkbox("Apply drift correction", value=True, help=HELP["apply_drift_correction"])
 
@@ -778,6 +789,7 @@ with st.sidebar:
         export_tracks = st.checkbox("Export tracks.csv", value=True, help=HELP["export_tracks"])
         export_per_cell = st.checkbox("Export per_cell.csv", value=True, help=HELP["export_per_cell"])
         export_per_frame = st.checkbox("Export per_frame.csv", value=True, help=HELP["export_per_frame"])
+        export_lineage = st.checkbox("Export lineage.csv (division tracking)", value=True, help=HELP["export_lineage"])
         export_masks = st.checkbox("Export masks TIFF (masks_filt.tif)", value=False, help=HELP["export_masks"])
         export_seg_mp4 = st.checkbox("Export segmentation overlay video", value=True, help=HELP["export_seg_mp4"])
         export_track_mp4 = st.checkbox("Export tracking overlay video", value=True, help=HELP["export_track_mp4"])
@@ -862,7 +874,6 @@ with col_run:
                 search_range_px=float(search_range),
                 memory=int(memory),
                 min_track_len=int(min_track_len if run_mode == "Full" else max(2, int(preview_frames) - 1)),
-                jump_max_factor=float(jump_factor),
                 apply_drift_correction=bool(apply_drift),
             )
 
@@ -871,6 +882,7 @@ with col_run:
                 export_tracks_csv=bool(export_tracks),
                 export_per_cell_csv=bool(export_per_cell),
                 export_per_frame_csv=bool(export_per_frame),
+                export_lineage_csv=bool(export_lineage),
                 export_masks_tiff=bool(export_masks or open_napari_qc),
                 export_segmentation_overlay_mp4=bool(export_seg_mp4),
                 export_tracking_overlay_mp4=bool(export_track_mp4),
@@ -951,7 +963,7 @@ if last is not None:
         st.write({"run_dir": str(last.run_dir)})
 
     def _downloads_for(prefix: str, exported):
-        cols = st.columns(6)
+        cols = st.columns(7)
         with cols[0]:
             _download_chip(
                 label="params.json",
@@ -982,13 +994,19 @@ if last is not None:
             )
         with cols[4]:
             _download_chip(
+                label="lineage.csv",
+                path=getattr(exported, "lineage_csv", None),
+                mime="text/csv",
+                key=f"dl_{prefix}_lineage",
+            )
+        with cols[5]:
+            _download_chip(
                 label="per_step_velocity.csv",
                 path=getattr(exported, "per_step_csv", None),
                 mime="text/csv",
                 key=f"dl_{prefix}_per_step",
             )
-        with cols[5]:
-            # Videos can be large; show as optional downloads when present.
+        with cols[6]:
             _download_chip(
                 label="tracking_overlay.mp4",
                 path=getattr(exported, "tracking_overlay_mp4", None),

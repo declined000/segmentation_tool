@@ -1,11 +1,11 @@
 numpy==1.23.5
-pandas==1.5.3
+pandas>=2.0.3
 matplotlib==3.10.8
 tifffile==2025.5.10
 dask[array]==2024.8.1
 scikit-image==0.24.0
 opencv-python-headless==4.11.0.86
-trackpy
+btrack==0.7.0
 
 # Needed so the venv can be selected as a Jupyter kernel
 ipykernel==6.31.0

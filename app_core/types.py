@@ -24,9 +24,9 @@ class MetadataParams:
 
 @dataclass(frozen=True)
 class SegmentationParams:
-    model_type: Literal["cyto2", "nuclei"] = "cyto2"
+    model_type: Literal["cyto2", "nuclei", "cpsam"] = "cyto2"
     diameter_px: float | None = 30.0  # None => Cellpose auto
-    cellprob_threshold: float = 0.0
+    cellprob_threshold: float = 0.5
     flow_threshold: float = 0.4
     use_gpu: bool = False
     denoise: bool = False  # use Cellpose3 CellposeDenoiseModel for noisy / phase-contrast images
@@ -34,24 +34,21 @@ class SegmentationParams:
 
 @dataclass(frozen=True)
 class QcParams:
-    min_area_px: int = 200
-    max_area_px: int = 6000
+    min_area_px: int = 400
+    max_area_px: int = 8000
     border_px: int = 8
 
-    # Advanced (optional)
     min_solidity: float = 0.80
-    min_eccentricity: float = 0.15
-    max_circularity: float = 0.90
+    min_eccentricity: float = 0.0
+    max_circularity: float = 0.99
 
 
 @dataclass(frozen=True)
 class TrackingParams:
     search_range_px: float = 20.0
-    memory: int = 1
+    memory: int = 2
     min_track_len: int = 10
 
-    # Advanced
-    jump_max_factor: float = 2.5
     apply_drift_correction: bool = True
 
 
@@ -60,6 +57,7 @@ class OutputOptions:
     export_tracks_csv: bool = True
     export_per_cell_csv: bool = True
     export_per_frame_csv: bool = True
+    export_lineage_csv: bool = True
     export_masks_tiff: bool = False
     export_segmentation_overlay_mp4: bool = True
     export_tracking_overlay_mp4: bool = True
@@ -82,6 +80,7 @@ class SingleRunResult:
     tracks: pd.DataFrame
     per_frame: pd.DataFrame
     per_cell: pd.DataFrame
+    lineage: pd.DataFrame
 
 
 @dataclass(frozen=True)
@@ -97,6 +96,8 @@ class Summary:
     n_tracks: int
     mean_track_len: float | None
 
+    n_divisions: int | None = None
+
     # Pair-only summary fields can be computed from EF tracks/corrected steps
     mean_directed_velocity_um_per_min: float | None = None
     mean_directedness: float | None = None
@@ -109,6 +110,7 @@ class ExportedPaths:
     per_cell_csv: Path | None
     per_frame_csv: Path | None
     per_step_csv: Path | None
+    lineage_csv: Path | None
     masks_tiff: Path | None
     segmentation_overlay_mp4: Path | None
     tracking_overlay_mp4: Path | None
@@ -121,6 +123,7 @@ def exported_with(paths: ExportedPaths, **updates) -> ExportedPaths:
         "per_cell_csv": paths.per_cell_csv,
         "per_frame_csv": paths.per_frame_csv,
         "per_step_csv": paths.per_step_csv,
+        "lineage_csv": paths.lineage_csv,
         "masks_tiff": paths.masks_tiff,
         "segmentation_overlay_mp4": paths.segmentation_overlay_mp4,
         "tracking_overlay_mp4": paths.tracking_overlay_mp4,

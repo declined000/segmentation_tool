@@ -29,6 +29,7 @@ def export_csvs(
     per_cell_csv = None
     per_frame_csv = None
     per_step_csv = None
+    lineage_csv = None
 
     if out_opts.export_tracks_csv:
         tracks_csv = out_dir / "tracks.csv"
@@ -54,13 +55,17 @@ def export_csvs(
         steps.to_csv(step_csv, index=False)
         per_step_csv = step_csv
 
-    # params.json is written by pipeline into run_dir; this placeholder gets replaced by pipeline.
+    if out_opts.export_lineage_csv and not single.lineage.empty:
+        lineage_csv = out_dir / "lineage.csv"
+        single.lineage.to_csv(lineage_csv, index=True)
+
     return ExportedPaths(
         params_json=out_dir / "params.json",
         tracks_csv=tracks_csv,
         per_cell_csv=per_cell_csv,
         per_frame_csv=per_frame_csv,
         per_step_csv=per_step_csv,
+        lineage_csv=lineage_csv,
         masks_tiff=None,
         segmentation_overlay_mp4=None,
         tracking_overlay_mp4=None,
