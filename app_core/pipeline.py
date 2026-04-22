@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -51,11 +52,16 @@ def _run_cellpose_on_stack(
         and _torch.cuda.get_device_capability()[0] >= 8  # Ampere+
     )
 
-    model = models.CellposeModel(
-        gpu=bool(seg.use_gpu),
-        pretrained_model="cpsam",
-        use_bfloat16=_can_bf16,
-    )
+    # Some Cellpose builds (e.g. certain pip combinations) omit use_bfloat16
+    # on CellposeModel; only pass it when supported.
+    _init_params = inspect.signature(models.CellposeModel).parameters
+    _kwargs: dict = {
+        "gpu": bool(seg.use_gpu),
+        "pretrained_model": "cpsam",
+    }
+    if "use_bfloat16" in _init_params:
+        _kwargs["use_bfloat16"] = _can_bf16
+    model = models.CellposeModel(**_kwargs)
 
     masks: list[np.ndarray] = []
     for t in range(T):
