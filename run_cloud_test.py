@@ -6,10 +6,59 @@ Designed for Google Cloud VMs with GPU. Outputs go to results_cloud/<stem>/.
 Usage:
     python run_cloud_test.py path/to/video.tif [--max-frames N] [--no-gpu]
 """
+from __future__ import annotations
+
 import argparse
+import os
+import site
 import sys
 import time
 from pathlib import Path
+
+
+def _prepend_torch_cuda_libs() -> None:
+    """Linux: load PyTorch's bundled cuBLAS before other packages (e.g. OpenCV).
+
+    Fixes ``Invalid handle. Cannot load symbol cublasLtCreate`` when
+    ``LD_LIBRARY_PATH`` would otherwise pick a mismatched system libcublas.
+    """
+    if "--no-gpu" in sys.argv or not sys.platform.startswith("linux"):
+        return
+    bases: list[str] = []
+    try:
+        u = site.getusersitepackages()
+        if u:
+            bases.append(u)
+    except Exception:
+        pass
+    try:
+        bases.extend(site.getsitepackages())
+    except Exception:
+        pass
+    for base in bases:
+        lib = os.path.join(base, "torch", "lib")
+        if os.path.isdir(lib):
+            prev = os.environ.get("LD_LIBRARY_PATH", "")
+            os.environ["LD_LIBRARY_PATH"] = lib + (os.pathsep + prev if prev else "")
+            return
+
+
+def _prime_cuda_before_pipeline() -> None:
+    """Initialize CUDA via PyTorch before importing app_core (skimage/cellpose chain)."""
+    if "--no-gpu" in sys.argv:
+        return
+    _prepend_torch_cuda_libs()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.init()
+            torch.zeros(1, device="cuda")
+    except Exception:
+        pass
+
+
+_prime_cuda_before_pipeline()
 
 from app_core.pipeline import run_single_movie
 from app_core.types import (

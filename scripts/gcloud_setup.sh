@@ -31,6 +31,13 @@ echo "  Re-aligning PyTorch + CUDA (cu124 wheels work on GCP CUDA 12.x drivers) 
 python3 -m pip install --quiet --upgrade torch torchvision \
     --index-url https://download.pytorch.org/whl/cu124
 
+_TORCH_LIB="$(python3 -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')"
+export LD_LIBRARY_PATH="${_TORCH_LIB}:${LD_LIBRARY_PATH:-}"
+# Persist for new SSH sessions (idempotent marker)
+if ! grep -q "bioelectricity-torch-lib" ~/.bashrc 2>/dev/null; then
+    echo "export LD_LIBRARY_PATH=\"${_TORCH_LIB}:\${LD_LIBRARY_PATH:-}\"  # bioelectricity-torch-lib" >> ~/.bashrc
+fi
+
 python3 -c "import torch; assert torch.cuda.is_available(), 'CUDA not found'; x=torch.zeros(1, device='cuda'); print(f'PyTorch {torch.__version__}, GPU: {torch.cuda.get_device_name(0)}, cuda tensor OK')"
 
 echo "=== 3/4  Clone sam4celltracking ==="
