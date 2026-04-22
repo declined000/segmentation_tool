@@ -4,61 +4,36 @@ Run the full pipeline (cpsam segmentation + SAM2 tracking) on a single video.
 Designed for Google Cloud VMs with GPU. Outputs go to results_cloud/<stem>/.
 
 Usage:
-    python run_cloud_test.py path/to/video.tif [--max-frames N] [--no-gpu]
+    python3 run_cloud_test.py path/to/video.tif [--max-frames N] [--no-gpu]
+
+Requires LD_LIBRARY_PATH set before launch (see scripts/gcloud_setup.sh).
 """
 from __future__ import annotations
 
 import argparse
 import os
-import site
 import sys
 import time
 from pathlib import Path
 
-
-def _prepend_torch_cuda_libs() -> None:
-    """Linux: load PyTorch's bundled cuBLAS before other packages (e.g. OpenCV).
-
-    Fixes ``Invalid handle. Cannot load symbol cublasLtCreate`` when
-    ``LD_LIBRARY_PATH`` would otherwise pick a mismatched system libcublas.
-    """
-    if "--no-gpu" in sys.argv or not sys.platform.startswith("linux"):
-        return
-    bases: list[str] = []
+# Initialize CUDA via the *actually imported* torch BEFORE importing the
+# pipeline (which pulls in skimage, imageio, etc.).  This ensures PyTorch's
+# cuBLAS is loaded first.  We do NOT touch LD_LIBRARY_PATH here — that must
+# be set in the shell before python3 starts.
+if "--no-gpu" not in sys.argv:
     try:
-        u = site.getusersitepackages()
-        if u:
-            bases.append(u)
-    except Exception:
-        pass
-    try:
-        bases.extend(site.getsitepackages())
-    except Exception:
-        pass
-    for base in bases:
-        lib = os.path.join(base, "torch", "lib")
-        if os.path.isdir(lib):
-            prev = os.environ.get("LD_LIBRARY_PATH", "")
-            os.environ["LD_LIBRARY_PATH"] = lib + (os.pathsep + prev if prev else "")
-            return
+        import torch as _torch
 
-
-def _prime_cuda_before_pipeline() -> None:
-    """Initialize CUDA via PyTorch before importing app_core (skimage/cellpose chain)."""
-    if "--no-gpu" in sys.argv:
-        return
-    _prepend_torch_cuda_libs()
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.init()
-            torch.zeros(1, device="cuda")
-    except Exception:
-        pass
-
-
-_prime_cuda_before_pipeline()
+        if _torch.cuda.is_available():
+            _torch.cuda.init()
+            _x = _torch.randn(2, 2, device="cuda")
+            _y = _torch.matmul(_x, _x)          # force cuBLAS load
+            del _x, _y
+            print(f"GPU: {_torch.cuda.get_device_name(0)}")
+        else:
+            print("WARNING: CUDA not available, falling back to CPU")
+    except Exception as e:
+        print(f"WARNING: CUDA init failed ({e}), falling back to CPU")
 
 from app_core.pipeline import run_single_movie
 from app_core.types import (
