@@ -7,7 +7,6 @@ import numpy as np
 import pandas as pd
 import tifffile as tf
 
-import cv2
 import imageio.v2 as imageio
 from skimage.color import label2rgb
 from skimage.segmentation import find_boundaries
@@ -155,6 +154,8 @@ def _to_float01(img16: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
 
 
 def _draw_centroids(rgb_u8: np.ndarray, pts_df: pd.DataFrame, t: int, *, color=(255, 255, 0)):
+    import cv2  # after torch/cellpose on GPU — avoids libcublas conflicts
+
     if pts_df.empty:
         return
     this = pts_df[pts_df["frame"] == t]
@@ -166,6 +167,8 @@ def _draw_centroids(rgb_u8: np.ndarray, pts_df: pd.DataFrame, t: int, *, color=(
 
 
 def _draw_track_tails(rgb_u8: np.ndarray, tracks_df: pd.DataFrame, t: int, tail_frames: int, *, show_ids: bool):
+    import cv2  # after torch/cellpose on GPU — avoids libcublas conflicts
+
     if tracks_df is None or tracks_df.empty:
         return
     t0 = max(0, int(t) - int(tail_frames))
