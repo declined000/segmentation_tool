@@ -10,8 +10,9 @@ echo "=== 1/4  System packages ==="
 sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg git
 
 echo "=== 2/4  Python dependencies ==="
-pip install --quiet --upgrade pip
-pip install --quiet \
+export PATH="$HOME/.local/bin:$PATH"
+python3 -m pip install --quiet --upgrade pip
+python3 -m pip install --quiet \
     numpy==1.23.5 \
     "pandas>=2.0.3" \
     matplotlib==3.10.8 \
@@ -23,9 +24,14 @@ pip install --quiet \
     imageio==2.37.2 \
     imageio-ffmpeg==0.6.0
 
-# PyTorch with CUDA should already be on the Deep Learning VM.
-# Verify:
-python -c "import torch; assert torch.cuda.is_available(), 'CUDA not found'; print(f'PyTorch {torch.__version__}, GPU: {torch.cuda.get_device_name(0)}')"
+# Cellpose's pip metadata can pull a PyTorch wheel that does not match the
+# VM's NVIDIA driver / libcublas. Re-pin CUDA PyTorch from the official index
+# so cuBLAS loads (fixes "Invalid handle ... cublasLtCreate").
+echo "  Re-aligning PyTorch + CUDA (cu124 wheels work on GCP CUDA 12.x drivers) ..."
+python3 -m pip install --quiet --upgrade torch torchvision \
+    --index-url https://download.pytorch.org/whl/cu124
+
+python3 -c "import torch; assert torch.cuda.is_available(), 'CUDA not found'; x=torch.zeros(1, device='cuda'); print(f'PyTorch {torch.__version__}, GPU: {torch.cuda.get_device_name(0)}, cuda tensor OK')"
 
 echo "=== 3/4  Clone sam4celltracking ==="
 if [ ! -d "sam4celltracking" ]; then
@@ -48,11 +54,11 @@ fi
 echo ""
 echo "=========================================="
 echo "  Setup complete!"
-echo "  GPU:    $(python -c 'import torch; print(torch.cuda.get_device_name(0))')"
-echo "  VRAM:   $(python -c 'import torch; print(f\"{torch.cuda.get_device_properties(0).total_mem/1e9:.1f} GB\")')"
+echo "  GPU:    $(python3 -c 'import torch; print(torch.cuda.get_device_name(0))')"
+echo "  VRAM:   $(python3 -c 'import torch; print(f\"{torch.cuda.get_device_properties(0).total_mem/1e9:.1f} GB\")')"
 echo "=========================================="
 echo ""
 echo "Next steps:"
 echo "  1. Upload a .tif video:  gcloud compute scp LOCAL_FILE VM_NAME:~/bioelectricity-project/"
-echo "  2. Run the pipeline:     python run_cloud_test.py YOUR_FILE.tif"
+echo "  2. Run the pipeline:     python3 run_cloud_test.py YOUR_FILE.tif"
 echo ""
