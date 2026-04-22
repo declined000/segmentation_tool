@@ -24,12 +24,12 @@ class MetadataParams:
 
 @dataclass(frozen=True)
 class SegmentationParams:
-    model_type: Literal["cyto2", "nuclei", "cpsam"] = "cyto2"
-    diameter_px: float | None = 30.0  # None => Cellpose auto
+    """Cellpose-SAM (cpsam) only — generalist segmentation, optional manual diameter."""
+
+    diameter_px: float | None = None  # None => native cpsam sizing (recommended)
     cellprob_threshold: float = 0.5
     flow_threshold: float = 0.4
     use_gpu: bool = False
-    denoise: bool = False  # use Cellpose3 CellposeDenoiseModel for noisy / phase-contrast images
 
 
 @dataclass(frozen=True)
@@ -43,13 +43,17 @@ class QcParams:
     max_circularity: float = 0.99
 
 
+
 @dataclass(frozen=True)
 class TrackingParams:
-    search_range_px: float = 20.0
-    memory: int = 2
     min_track_len: int = 10
-
     apply_drift_correction: bool = True
+
+    # SAM2 (sam4celltracking) parameters
+    sam2_window_size: int = 128     # patch size for SAM2 linking
+    sam2_dis_threshold: int = 50    # min mask pixels to continue tracking
+    sam2_neighbor_dist: int = 30    # max pixels to link mask to prediction
+    sam4ct_path: str = "sam4celltracking"  # path to cloned repo
 
 
 @dataclass(frozen=True)

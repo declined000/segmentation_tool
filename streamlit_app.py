@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 import time
 
 import numpy as np
 import streamlit as st
 
-from app_core.env_check import check_cellpose_cyto2, check_napari_qt, check_torch
+from app_core.env_check import (
+    check_cellpose,
+    check_napari_qt,
+    check_sam2_layout,
+    check_torch,
+)
 from app_core.napari_launch import launch_napari
 from app_core.pipeline import run_and_export
 from app_core.types import (
@@ -88,17 +94,11 @@ HELP = {
         "For your setup (cathode on the left): choose **left positive (-1)**."
     ),
 
-    # Segmentation
-    "model_type": (
-        "Cellpose model.\n\n"
-        "- **cyto2**: larger cells (corneal epithelial, microglia)\n"
-        "- **nuclei**: small round cells (neutrophils) or fluorescent nuclei\n\n"
-        "Choose based on your cell type."
-    ),
+    # Segmentation (Cellpose-SAM / cpsam only)
     "diameter_auto": (
-        "If enabled, Cellpose estimates cell size automatically.\n\n"
-        "Use Auto when you don't know the size or it varies a lot.\n"
-        "Turn off Auto if cells are over-split or merged and you want control."
+        "If enabled, diameter is left unset so Cellpose-SAM uses its native sizing "
+        "(recommended for mixed or unknown cell sizes).\n\n"
+        "Turn off Auto only if you need a fixed diameter in pixels to correct over-splitting or merging."
     ),
     "diameter_px": (
         "Expected cell diameter in pixels.\n\n"
@@ -121,12 +121,6 @@ HELP = {
     "use_gpu": (
         "Use GPU acceleration (if CUDA is correctly installed).\n\n"
         "If you're unsure, leave it off — CPU works fine for 37 frames."
-    ),
-    "denoise": (
-        "Use Cellpose3 built-in image restoration before segmentation.\n\n"
-        "Recommended for **noisy or phase-contrast images** with halo/ring artifacts.\n"
-        "The model denoises each frame before detecting cells, reducing false detections.\n\n"
-        "Adds ~1-2 seconds per frame. Use **Preview** to check if it helps."
     ),
 
     # QC
@@ -165,30 +159,36 @@ HELP = {
         "Notebook default: **0.90**."
     ),
 
-    # Tracking
-    "apply_drift_correction": (
-        "Subtract median frame-to-frame displacement from all tracks to remove global drift.\n\n"
-        "Turn **off** if your experiment has no stage drift or if you want raw uncorrected tracks.\n\n"
-        "Turn **on** (default) if the field of view shifts over time."
-    ),
-    "search_range": (
-        "Max distance (pixels) a cell can move between frames.\n\n"
-        "If tracks break often → increase.\n"
-        "If tracks jump between nearby cells → decrease.\n\n"
-        "Rule of thumb: slightly larger than the biggest expected per-frame movement."
-    ),
-    "memory": (
-        "How many frames a cell may be missing and still keep the same track.\n\n"
-        "If cells flicker/disappear briefly → increase.\n"
-        "If identity swaps happen → decrease.\n\n"
-        "Safe default: **1**."
-    ),
+    # Tracking (SAM2)
     "min_track_len": (
-        "Minimum number of frames required for a track to be kept.\n\n"
-        "If too many short noisy tracks → increase.\n"
-        "If you lose real but short-lived cells → decrease.\n\n"
-        "Safe default for ~37 frames: **10**."
+        "Minimum number of frames a track must span to be kept.\n\n"
+        "Short tracks are often noise. 10 is a good default."
     ),
+    "drift_correction": (
+        "Subtract median population drift from each step.\n\n"
+        "Recommended for adherent cells where the field of view drifts."
+    ),
+    "sam2_window_size": (
+        "SAM2 patch size for the linking algorithm.\n\n"
+        "Larger values handle bigger cells but use more VRAM.\n"
+        "Default: **128**."
+    ),
+    "sam2_dis_threshold": (
+        "Minimum mask pixels to continue tracking a cell.\n\n"
+        "Lower = keep tracking smaller cells.\n"
+        "Default: **50**."
+    ),
+    "sam2_neighbor_dist": (
+        "Maximum pixel distance to link a mask to a SAM2 prediction.\n\n"
+        "Increase for fast-moving cells.\n"
+        "Default: **30**."
+    ),
+    "sam4ct_path": (
+        "Path to the cloned `sam4celltracking` repository.\n\n"
+        "The repo must be cloned and the SAM2.1 model downloaded.\n"
+        "See README for setup instructions."
+    ),
+
     # Outputs
     "export_tracks": "Export `tracks.csv` (per-frame tracking table). Usually useful.",
     "export_per_cell": "Export `per_cell.csv` (one row per tracked cell). Great for electrotaxis summaries.",
@@ -216,48 +216,39 @@ HELP = {
         "After a run, use **Launch Napari Now** to open the interactive viewer."
     ),
     "cell_preset": (
-        "Pre-fill segmentation, QC, and tracking settings for common cell types.\n\n"
-        "- **Corneal epithelial**: diameter ~26 um, permissive shape filters.\n"
-        "- **Neutrophils**: small fast cells. Use with **nuclei** model + **Auto diameter** for best results.\n"
-        "- **Large (e.g. microglia)**: bigger diameter + area range + search range.\n"
-        "- **Custom**: start from current values and tune manually.\n\n"
-        "After selecting a preset, use **Preview** to verify the settings look right."
+        "Pre-fill QC filter ranges for common cell types (segmentation is always Cellpose-SAM).\n\n"
+        "- **Corneal epithelial**: medium area, permissive shape filters.\n"
+        "- **Neutrophils**: small area range for small fast cells.\n"
+        "- **Large (e.g. microglia)**: larger max area, permissive solidity.\n"
+        "- **Custom**: keep current values and tune manually.\n\n"
+        "After selecting a preset, use **Preview** to verify masks look right."
     ),
 }
 
 CELL_PRESETS = {
     "Corneal epithelial": {
-        "p_diameter_px": 30.0,
         "p_min_area": 400,
         "p_max_area": 8000,
         "p_border_px": 8,
         "p_min_solidity": 0.80,
         "p_min_eccentricity": 0.0,
         "p_max_circularity": 0.99,
-        "p_search_range": 20.0,
-        "p_memory": 2,
     },
     "Neutrophils": {
-        "p_diameter_px": 30.0,
         "p_min_area": 20,
         "p_max_area": 2000,
         "p_border_px": 5,
         "p_min_solidity": 0.85,
         "p_min_eccentricity": 0.0,
         "p_max_circularity": 0.99,
-        "p_search_range": 20.0,
-        "p_memory": 2,
     },
     "Large (e.g. microglia)": {
-        "p_diameter_px": 60.0,
         "p_min_area": 500,
         "p_max_area": 15000,
         "p_border_px": 15,
         "p_min_solidity": 0.70,
         "p_min_eccentricity": 0.0,
         "p_max_circularity": 0.99,
-        "p_search_range": 30.0,
-        "p_memory": 2,
     },
     "Custom": None,
 }
@@ -270,9 +261,9 @@ def _save_upload(upload, dest: Path) -> Path:
     return dest
 
 
-def _env_panel(wants_napari: bool):
+def _env_panel(wants_napari: bool, *, sam4ct_path: str):
     st.markdown("#### Environment check")
-    statuses = [check_cellpose_cyto2(), check_torch()]
+    statuses = [check_cellpose(), check_torch()]
     if wants_napari:
         statuses.append(check_napari_qt())
 
@@ -283,6 +274,13 @@ def _env_panel(wants_napari: bool):
         else:
             ok_all = False
             st.error(f"{s.title}: {s.details}")
+
+    sam2 = check_sam2_layout(sam4ct_path)
+    if sam2.ok:
+        st.success(f"{sam2.title}: OK")
+    else:
+        st.warning(f"{sam2.title}: {sam2.details}")
+
     return ok_all
 
 
@@ -672,15 +670,13 @@ with st.sidebar:
     st.markdown("<div class='sb-section'><span>🔬</span>Cell type preset</div>", unsafe_allow_html=True)
 
     _WIDGET_DEFAULTS = {
-        "p_diameter_px": 30.0,
+        "p_diameter_px": 30.0,  # used only when Auto diameter is off
         "p_min_area": 400,
         "p_max_area": 8000,
         "p_border_px": 8,
         "p_min_solidity": 0.80,
         "p_min_eccentricity": 0.0,
         "p_max_circularity": 0.99,
-        "p_search_range": 20.0,
-        "p_memory": 2,
     }
     for _k, _v in _WIDGET_DEFAULTS.items():
         if _k not in st.session_state:
@@ -700,13 +696,12 @@ with st.sidebar:
                 st.session_state[_k] = _v
             st.rerun()
 
-    with st.expander("Segmentation", expanded=True):
+    with st.expander("Segmentation (Cellpose-SAM)", expanded=True):
         st.caption(
-            "Defaults are tuned for medium adherent cells (~30 px diameter). "
-            "For larger cells (e.g. microglia), increase **Diameter** and use **Preview** to check."
+            "Segmentation always uses **Cellpose-SAM (`cpsam`)**. "
+            "Leave **Auto diameter** on unless masks are systematically over-split or merged."
         )
-        model_type = st.selectbox("Model", ["cyto2", "nuclei"], index=0, help=HELP["model_type"])
-        diameter_auto = st.checkbox("Auto diameter", value=False, help=HELP["diameter_auto"])
+        diameter_auto = st.checkbox("Auto diameter", value=True, help=HELP["diameter_auto"])
         diameter_px = None if diameter_auto else float(
             st.number_input("Diameter (px)", min_value=5.0, step=1.0, help=HELP["diameter_px"], key="p_diameter_px")
         )
@@ -731,7 +726,6 @@ with st.sidebar:
             )
         )
         use_gpu = st.checkbox("Use GPU", value=False, help=HELP["use_gpu"])
-        use_denoise = st.checkbox("Denoise before segmentation (Cellpose3)", value=False, help=HELP["denoise"])
 
     with st.expander("QC filter", expanded=False):
         st.caption(
@@ -770,20 +764,56 @@ with st.sidebar:
             )
         )
 
-    with st.expander("Tracking", expanded=False):
+    with st.expander("Tracking (SAM2)", expanded=False):
         st.caption(
-            "Uses Bayesian tracking (btrack) with automatic cell division detection. "
-            "If larger/faster cells lose their tracks, increase **Search range**. "
-            "If cells flicker in and out of detection, increase **Memory** to 2-3."
+            "SAM2-based cell tracking with backward propagation. "
+            "Requires the `sam4celltracking` repo to be cloned locally "
+            "and the SAM2.1 model downloaded. See README."
         )
-        search_range = float(
-            st.number_input("Search range (px)", min_value=1.0, step=1.0, help=HELP["search_range"], key="p_search_range")
+        if sys.platform == "win32":
+            st.info(
+                "**Windows:** upstream sam4celltracking targets **Linux + CUDA**. "
+                "If tracking fails after you install the repo and weights, run the "
+                "same app inside **WSL2 Ubuntu** with GPU in WSL (see README "
+                "“Windows + SAM2”). Segmentation in the GUI still works on native Windows."
+            )
+        sam4ct_path = st.text_input(
+            "sam4celltracking path",
+            value=str(APP_ROOT / "sam4celltracking"),
+            help=HELP["sam4ct_path"],
         )
-        memory = int(st.number_input("Memory (frames)", min_value=0, step=1, help=HELP["memory"], key="p_memory"))
         min_track_len = int(
-            st.number_input("Min track length", min_value=1, value=10, step=1, help=HELP["min_track_len"])
+            st.number_input(
+                "Min track length (frames)",
+                min_value=1, value=10, step=1,
+                help=HELP["min_track_len"],
+            )
         )
-        apply_drift = st.checkbox("Apply drift correction", value=True, help=HELP["apply_drift_correction"])
+        apply_drift_corr = st.checkbox(
+            "Drift correction", value=True,
+            help=HELP["drift_correction"],
+        )
+        sam2_window = int(
+            st.number_input(
+                "SAM2 window size",
+                min_value=32, value=128, step=32,
+                help=HELP["sam2_window_size"],
+            )
+        )
+        sam2_dis = int(
+            st.number_input(
+                "SAM2 disappear threshold (px)",
+                min_value=5, value=50, step=5,
+                help=HELP["sam2_dis_threshold"],
+            )
+        )
+        sam2_neighbor = int(
+            st.number_input(
+                "SAM2 neighbor dist (px)",
+                min_value=5, value=30, step=5,
+                help=HELP["sam2_neighbor_dist"],
+            )
+        )
 
     with st.expander("Outputs", expanded=False):
         export_tracks = st.checkbox("Export tracks.csv", value=True, help=HELP["export_tracks"])
@@ -799,7 +829,7 @@ with st.sidebar:
 
 
 with st.container(border=True):
-    env_ok = _env_panel(wants_napari=open_napari_qc)
+    env_ok = _env_panel(wants_napari=open_napari_qc, sam4ct_path=str(sam4ct_path))
 
 if not env_ok:
     st.stop()
@@ -855,12 +885,10 @@ with col_run:
                 ef_sign=int(ef_sign_val),
             )
             seg = SegmentationParams(
-                model_type=str(model_type),
                 diameter_px=diameter_px,
                 cellprob_threshold=float(cellprob_thr),
                 flow_threshold=float(flow_thr),
                 use_gpu=bool(use_gpu),
-                denoise=bool(use_denoise),
             )
             qc = QcParams(
                 min_area_px=int(min_area),
@@ -871,13 +899,13 @@ with col_run:
                 max_circularity=float(max_circularity),
             )
             tr = TrackingParams(
-                search_range_px=float(search_range),
-                memory=int(memory),
-                min_track_len=int(min_track_len if run_mode == "Full" else max(2, int(preview_frames) - 1)),
-                apply_drift_correction=bool(apply_drift),
+                min_track_len=int(min_track_len),
+                apply_drift_correction=bool(apply_drift_corr),
+                sam2_window_size=int(sam2_window),
+                sam2_dis_threshold=int(sam2_dis),
+                sam2_neighbor_dist=int(sam2_neighbor),
+                sam4ct_path=str(sam4ct_path),
             )
-
-            # If user wants napari QC, ensure masks are saved.
             out_opts = OutputOptions(
                 export_tracks_csv=bool(export_tracks),
                 export_per_cell_csv=bool(export_per_cell),
@@ -894,11 +922,11 @@ with col_run:
                 + (" (Preview)" if max_frames is not None else " (Full)")
                 + "…"
             )
-            st.caption("Steps: Cellpose → QC filter → Tracking → Export")
+            st.caption("Steps: Cellpose → QC filter → SAM2 tracking → Metrics → Export")
             prog = st.progress(0, text="Starting…")
-            prog.progress(10, text="Running segmentation + tracking… (this can take a bit)")
+            prog.progress(10, text="Running segmentation + SAM2 tracking… (this can take a while)")
 
-            with st.spinner("Running segmentation + tracking..."):
+            with st.spinner("Running pipeline (segmentation + tracking)..."):
                 out = run_and_export(
                     mode=mode,
                     run_dir=run_dir,

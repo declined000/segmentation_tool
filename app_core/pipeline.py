@@ -30,6 +30,7 @@ from .exports import (
     make_preview_rgb,
 )
 from .types import exported_with
+from .sam2_support import format_tracking_failure, is_native_windows, WSL2_SAM2_GUIDANCE
 
 
 def _run_cellpose_on_stack(
@@ -50,25 +51,11 @@ def _run_cellpose_on_stack(
         and _torch.cuda.get_device_capability()[0] >= 8  # Ampere+
     )
 
-    if str(seg.model_type) == "cpsam":
-        model = models.CellposeModel(
-            gpu=bool(seg.use_gpu),
-            pretrained_model="cpsam",
-            use_bfloat16=_can_bf16,
-        )
-    elif seg.denoise:
-        from cellpose import denoise
-        restore_type = f"denoise_{seg.model_type}"
-        model = denoise.CellposeDenoiseModel(
-            gpu=bool(seg.use_gpu),
-            model_type=str(seg.model_type),
-            restore_type=restore_type,
-        )
-    else:
-        model = models.CellposeModel(
-            gpu=bool(seg.use_gpu),
-            pretrained_model=str(seg.model_type),
-        )
+    model = models.CellposeModel(
+        gpu=bool(seg.use_gpu),
+        pretrained_model="cpsam",
+        use_bfloat16=_can_bf16,
+    )
 
     masks: list[np.ndarray] = []
     for t in range(T):
@@ -80,9 +67,7 @@ def _run_cellpose_on_stack(
             cellprob_threshold=float(seg.cellprob_threshold),
             normalize=True,
         )
-        # CellposeDenoiseModel returns (masks, flows, styles, imgs_dn);
-        # Cellpose returns (masks, flows, styles, diams)
-        m = result[0]
+        m = result[0]  # masks
         masks.append(m.astype(np.int32, copy=False))
 
     return np.stack(masks, axis=0)
@@ -162,116 +147,93 @@ def _qc_centroids_from_masks(
     return pts, masks_filt
 
 
-def _make_btrack_config(tr: TrackingParams):
-    """Build a btrack TrackerConfig tuned for 2-D cell tracking."""
-    from btrack.config import TrackerConfig, MotionModel, HypothesisModel
+# ── SAM2 tracking helpers ────────────────────────────────────
 
-    sr = float(tr.search_range_px)
-
-    # Constant-velocity Kalman filter in 3-D (btrack always uses x, y, z;
-    # for 2-D data z stays ≈ 0).
-    motion = MotionModel(
-        measurements=3,
-        states=6,
-        A=[[1, 0, 0, 1, 0, 0],
-           [0, 1, 0, 0, 1, 0],
-           [0, 0, 1, 0, 0, 1],
-           [0, 0, 0, 1, 0, 0],
-           [0, 0, 0, 0, 1, 0],
-           [0, 0, 0, 0, 0, 1]],
-        H=[[1, 0, 0, 0, 0, 0],
-           [0, 1, 0, 0, 0, 0],
-           [0, 0, 1, 0, 0, 0]],
-        P=[[150, 0, 0, 0, 0, 0],
-           [0, 150, 0, 0, 0, 0],
-           [0, 0, 150, 0, 0, 0],
-           [0, 0, 0, 15, 0, 0],
-           [0, 0, 0, 0, 15, 0],
-           [0, 0, 0, 0, 0, 15]],
-        R=[[5, 0, 0],
-           [0, 5, 0],
-           [0, 0, 5]],
-        G=[[15, 15, 15, 10, 10, 10]],
-        dt=1.0,
-        accuracy=7.5,
-        max_lost=int(tr.memory),
-        prob_not_assign=0.1,
-        name="cell_motion",
-    )
-
-    # Global optimizer: strongly penalise division (lambda_branch) so real
-    # divisions must be unambiguous; keep linking cheap (lambda_link).
-    hypothesis = HypothesisModel(
-        hypotheses=[
-            "P_FP", "P_init", "P_term", "P_link", "P_branch", "P_dead",
-        ],
-        lambda_time=5.0,
-        lambda_dist=5.0,
-        lambda_link=5.0,
-        lambda_branch=50.0,
-        eta=1e-10,
-        theta_dist=sr,
-        theta_time=float(int(tr.memory) + 2),
-        dist_thresh=sr,
-        time_thresh=int(tr.memory) + 1,
-        apop_thresh=5,
-        segmentation_miss_rate=0.1,
-        apoptosis_rate=0.001,
-        relax=True,
-        name="cell_hypothesis",
-    )
-
-    return TrackerConfig(
-        motion_model=motion,
-        hypothesis_model=hypothesis,
-        max_search_radius=max(int(sr), 25),
-    )
+def _split_stacked_tiff(
+    stacked_path: Path, out_dir: Path, prefix: str = "t",
+) -> int:
+    """Split a (T,Y,X) stacked TIFF into per-frame TIFFs."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stack = tf.imread(str(stacked_path))
+    for t in range(stack.shape[0]):
+        tf.imwrite(str(out_dir / f"{prefix}{t:03d}.tif"), stack[t])
+    return stack.shape[0]
 
 
-def _track_centroids(
-    masks_filt: np.ndarray,
-    tr: TrackingParams,
+def _split_masks_array(
+    masks: np.ndarray, out_dir: Path, prefix: str = "mask",
+) -> int:
+    """Write a (T,Y,X) mask array as per-frame TIFFs."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for t in range(masks.shape[0]):
+        tf.imwrite(str(out_dir / f"{prefix}{t:03d}.tif"), masks[t])
+    return masks.shape[0]
+
+
+def _restack_masks(frame_dir: Path, n_frames: int) -> np.ndarray:
+    """Re-assemble per-frame mask TIFFs into a (T,Y,X) stacked array."""
+    frames = []
+    for t in range(n_frames):
+        p = frame_dir / f"mask{t:03d}.tif"
+        if p.exists():
+            frames.append(tf.imread(str(p)))
+        elif frames:
+            frames.append(np.zeros_like(frames[0]))
+        else:
+            raise FileNotFoundError(f"First mask not found: {p}")
+    return np.stack(frames, axis=0)
+
+
+def _parse_res_track(track_file: Path) -> dict:
+    """Parse res_track.txt (CTC format): track_id start end parent."""
+    tracks = {}
+    if not track_file.exists():
+        return tracks
+    with open(track_file, "r") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) == 4:
+                tid, start, end, parent = (
+                    int(parts[0]), int(parts[1]),
+                    int(parts[2]), int(parts[3]),
+                )
+                tracks[tid] = {
+                    "start": start, "end": end,
+                    "parent": parent if parent > 0 else None,
+                }
+    return tracks
+
+
+def _build_tracks_from_masks(
+    masks_tracked: np.ndarray, track_info: dict,
 ) -> pd.DataFrame:
-    """Track cells using btrack with division / lineage support.
-
-    Returns a DataFrame with columns:
-      frame, x, y, particle, parent, generation, fate
-    """
-    import btrack
-    from btrack.io import segmentation_to_objects
-
-    if int(masks_filt.max()) == 0:
-        return pd.DataFrame()
-
-    objects = segmentation_to_objects(masks_filt, properties=("area",))
-    if len(objects) == 0:
-        return pd.DataFrame()
-
-    H, W = int(masks_filt.shape[1]), int(masks_filt.shape[2])
-    cfg = _make_btrack_config(tr)
-
-    with btrack.BayesianTracker() as tracker:
-        tracker.configure(cfg)
-        tracker.volume = ((0, H), (0, W), (-1, 1))
-        tracker.append(objects)
-        tracker.track(step_size=100)
-        tracker.optimize()
-        btrack_tracks = tracker.tracks
+    """Build our standard tracks DataFrame from tracked masks + lineage."""
+    dividers = {
+        info["parent"]
+        for info in track_info.values()
+        if info["parent"] is not None
+    }
 
     rows: list[dict] = []
-    for trk in btrack_tracks:
-        pid = trk.parent
-        gen = getattr(trk, "generation", 0) or 0
-        fate_str = trk.fate.name if trk.fate is not None else "UNDEFINED"
-        for i in range(len(trk.t)):
+    for t in range(masks_tracked.shape[0]):
+        m = masks_tracked[t]
+        if m.max() == 0:
+            continue
+        props = regionprops_table(
+            m.astype(np.int32),
+            properties=("label", "centroid", "area"),
+        )
+        for i in range(len(props["label"])):
+            tid = int(props["label"][i])
+            info = track_info.get(tid, {})
             rows.append({
-                "frame": int(trk.t[i]),
-                "x": float(trk.x[i]),
-                "y": float(trk.y[i]),
-                "particle": int(trk.ID),
-                "parent": int(pid) if pid is not None else None,
-                "generation": int(gen),
-                "fate": fate_str,
+                "frame": t,
+                "y": float(props["centroid-0"][i]),
+                "x": float(props["centroid-1"][i]),
+                "area": float(props["area"][i]),
+                "particle": tid,
+                "parent": info.get("parent"),
+                "fate": "DIVIDE" if tid in dividers else "UNDEFINED",
             })
 
     df = pd.DataFrame(rows)
@@ -280,11 +242,122 @@ def _track_centroids(
 
     df = df.sort_values(["particle", "frame"]).copy()
 
-    counts = df.groupby("particle").size()
-    keep = counts[counts >= int(tr.min_track_len)].index
-    df = df[df["particle"].isin(keep)].copy()
+    c2p = {tid: info.get("parent") for tid, info in track_info.items()}
+    generation: dict[int, int] = {}
 
+    def _gen(pid: int) -> int:
+        if pid in generation:
+            return generation[pid]
+        p = c2p.get(pid)
+        if p is None:
+            generation[pid] = 0
+        else:
+            generation[pid] = _gen(p) + 1
+        return generation[pid]
+
+    for tid in df["particle"].unique():
+        _gen(int(tid))
+    df["generation"] = df["particle"].map(
+        lambda p: generation.get(int(p), 0),
+    )
     return df
+
+
+def _track_with_sam2(
+    movie_path: Path,
+    masks_filt: np.ndarray,
+    tr: TrackingParams,
+) -> tuple[pd.DataFrame, np.ndarray]:
+    """Track cells using SAM2 via sam4celltracking.
+
+    Requires the sam4celltracking repository to be cloned locally
+    and the SAM2.1 model to be downloaded. See README for setup.
+    """
+    import tempfile
+    import shutil
+    import os
+    import sys
+    import argparse
+
+    if int(masks_filt.max()) == 0:
+        return pd.DataFrame(), masks_filt
+
+    sam4ct = Path(tr.sam4ct_path).resolve()
+    sam_src = sam4ct / "src"
+    if not sam_src.exists():
+        msg = (
+            f"sam4celltracking not found at {sam4ct}.\n"
+            f"Clone it first:  git clone --depth=1 "
+            f"https://github.com/zhuchen96/sam4celltracking.git\n"
+            f"Then download the model:  see README.md"
+        )
+        if is_native_windows():
+            msg += f"\n\n{WSL2_SAM2_GUIDANCE}"
+        raise RuntimeError(msg)
+
+    model_path = sam_src / "trained_models" / "sam2.1_hiera_large.pt"
+    if not model_path.exists():
+        msg = (
+            f"SAM2 model not found at {model_path}.\n"
+            "Download it:\n"
+            "  wget https://dl.fbaipublicfiles.com/segment_anything_2/"
+            "092824/sam2.1_hiera_large.pt\n"
+            f"  -> save to {model_path}"
+        )
+        if is_native_windows():
+            msg += f"\n\n{WSL2_SAM2_GUIDANCE}"
+        raise RuntimeError(msg)
+
+    tmp = tempfile.mkdtemp(prefix="sam2_track_")
+    img_dir = Path(tmp) / "images"
+    msk_dir = Path(tmp) / "masks"
+    out_dir = Path(tmp) / "output"
+    for d in [img_dir, msk_dir, out_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    orig_cwd = os.getcwd()
+    orig_path = list(sys.path)
+
+    try:
+        n_frames = _split_stacked_tiff(movie_path, img_dir, prefix="t")
+        _split_masks_array(masks_filt[:n_frames], msk_dir, prefix="mask")
+
+        sys.path.insert(0, str(sam_src))
+        os.chdir(str(sam_src))
+
+        try:
+            from linking_2d_general import main as linking_main
+
+            args = argparse.Namespace(
+                image_path=str(img_dir),
+                mask_path=str(msk_dir),
+                out_path=str(out_dir),
+                size=int(tr.sam2_window_size),
+                dis_threshold=int(tr.sam2_dis_threshold),
+                neighbor_dist=int(tr.sam2_neighbor_dist),
+                neg_num=50,
+                visualize=False,
+            )
+            linking_main(args)
+
+            masks_tracked = _restack_masks(out_dir, n_frames)
+            track_info = _parse_res_track(out_dir / "res_track.txt")
+            tracks = _build_tracks_from_masks(masks_tracked, track_info)
+        except Exception as e:
+            raise RuntimeError(format_tracking_failure(e)) from e
+
+    finally:
+        os.chdir(orig_cwd)
+        sys.path[:] = orig_path
+
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    if not tracks.empty and int(tr.min_track_len) > 1:
+        counts = tracks.groupby("particle").size()
+        keep = counts[counts >= int(tr.min_track_len)].index
+        tracks = tracks[tracks["particle"].isin(keep)].copy()
+
+    return tracks, masks_tracked
 
 
 def _drift_correct(tracks: pd.DataFrame) -> pd.DataFrame:
@@ -369,6 +442,7 @@ def _per_cell_metrics(tracks: pd.DataFrame, meta: MetadataParams) -> pd.DataFram
 
     out = out.dropna(subset=["directedness_cos"])
     return out
+
 
 
 def _build_lineage_df(
@@ -493,9 +567,11 @@ def run_single_movie(
     tr: TrackingParams,
     max_frames: int | None,
 ) -> SingleRunResult:
+    """Run segmentation + QC + SAM2 tracking."""
     masks = _run_cellpose_on_stack(movie_path, seg=seg, max_frames=max_frames)
     pts, masks_filt = _qc_centroids_from_masks(masks, qc=qc)
-    tracks = _track_centroids(masks_filt, tr=tr)
+
+    tracks, masks_filt = _track_with_sam2(movie_path, masks_filt, tr)
 
     if not tracks.empty and tr.apply_drift_correction:
         tracks = _drift_correct(tracks)

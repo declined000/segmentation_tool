@@ -1,5 +1,8 @@
 """
-Quick pipeline run + napari inspection (one file at a time).
+Quick segmentation + napari inspection (one file at a time).
+
+Runs cpsam segmentation + QC locally and opens the result in napari.
+For full tracks + divisions, use the Streamlit app (SAM2 in pipeline) or `_inspect_sam2_tracking.py`.
 
 Usage:  .venv-cyto2\Scripts\python.exe -u _inspect_napari.py
 """
@@ -10,15 +13,10 @@ import tifffile as tf
 from app_core.pipeline import (
     _run_cellpose_on_stack,
     _qc_centroids_from_masks,
-    _track_centroids,
-    _build_lineage_df,
-    _per_cell_metrics,
 )
 from app_core.types import (
     SegmentationParams,
     QcParams,
-    TrackingParams,
-    MetadataParams,
 )
 
 # ── Which file to inspect ───────────────────────────────────────
@@ -31,10 +29,8 @@ TEST_FRAMES: int | None = 1
 HALF: str | None = "left"  # "left", "right", or None for full
 
 # ── Parameters (cpsam with auto diameter, GPU) ──────────────────
-seg  = SegmentationParams(model_type="cpsam", diameter_px=None, cellprob_threshold=0.0, flow_threshold=0.4, use_gpu=True)
-qc   = QcParams(min_area_px=400, max_area_px=8000, border_px=8, min_solidity=0.80, min_eccentricity=0.0, max_circularity=0.99)
-tr   = TrackingParams(search_range_px=20.0, memory=2, min_track_len=3, apply_drift_correction=False)
-meta = MetadataParams(dt_min=5.0, pixels_per_um=1.135, ef_on_frame=1, ef_axis="x", ef_sign=-1)
+seg = SegmentationParams(diameter_px=None, cellprob_threshold=0.0, flow_threshold=0.4, use_gpu=True)
+qc  = QcParams(min_area_px=400, max_area_px=8000, border_px=8, min_solidity=0.80, min_eccentricity=0.0, max_circularity=0.99)
 
 # ── Run pipeline ────────────────────────────────────────────────
 print(f"\n{'='*60}")
@@ -70,19 +66,6 @@ print("  QC filtering ...")
 pts, masks_filt = _qc_centroids_from_masks(masks, qc=qc)
 print(f"    {len(pts)} detections kept")
 
-print("  Tracking with btrack ...")
-tracks = _track_centroids(masks_filt, tr=tr)
-n_tracks = tracks["particle"].nunique() if not tracks.empty else 0
-print(f"    {n_tracks} tracks")
-
-if not tracks.empty:
-    tracks = tracks.sort_values(["particle", "frame"]).copy()
-    tracks[["dx", "dy"]] = tracks.groupby("particle")[["x", "y"]].diff()
-
-lineage = _build_lineage_df(tracks, meta)
-n_div = int((lineage["n_children"] >= 2).sum()) if not lineage.empty else 0
-print(f"    {n_div} division events detected")
-
 # ── Open napari ─────────────────────────────────────────────────
 print("\nOpening napari ...")
 import napari
@@ -97,11 +80,6 @@ if not pts.empty:
     viewer.add_points(
         pts[["frame", "y", "x"]].to_numpy(),
         size=6, face_color="yellow", name="centroids",
-    )
-if not tracks.empty:
-    viewer.add_tracks(
-        tracks[["particle", "frame", "y", "x"]].to_numpy(),
-        name="tracks",
     )
 
 viewer.reset_view()
