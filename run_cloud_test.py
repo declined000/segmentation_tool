@@ -11,9 +11,11 @@ Requires LD_LIBRARY_PATH set before launch (see scripts/gcloud_setup.sh).
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
+from dataclasses import asdict
 
 # On Linux VMs with mixed CUDA trees, preload pip-packaged cuBLAS/cuDNN first.
 if "--no-gpu" not in sys.argv:
@@ -97,6 +99,24 @@ def main():
 
     out_dir = Path("results_cloud") / args.tif.stem
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    params_json = out_dir / "params.json"
+    params_json.write_text(
+        json.dumps(
+            {
+                "runner": "run_cloud_test.py",
+                "input": str(args.tif.resolve()),
+                "max_frames": args.max_frames,
+                "meta": asdict(meta),
+                "seg": asdict(seg),
+                "qc": asdict(qc),
+                "tracking": asdict(tr),
+                "output": asdict(out_opts),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
     print(f"\n{'='*60}")
     print(f"  Pipeline: cpsam segmentation + SAM2 tracking")
