@@ -32,6 +32,7 @@ from .exports import (
 )
 from .types import exported_with
 from .sam2_support import format_tracking_failure, is_native_windows, WSL2_SAM2_GUIDANCE
+from .adjudication import run_phase1_adjudication
 
 
 def _run_cellpose_on_stack(
@@ -578,6 +579,7 @@ def run_single_movie(
     pts, masks_filt = _qc_centroids_from_masks(masks, qc=qc)
 
     tracks, masks_filt = _track_with_sam2(movie_path, masks_filt, tr)
+    tracks, adjudication_audit = run_phase1_adjudication(str(movie_path), masks_filt, tracks, tr)
 
     if not tracks.empty and tr.apply_drift_correction:
         tracks = _drift_correct(tracks)
@@ -597,6 +599,7 @@ def run_single_movie(
         per_frame=per_frame,
         per_cell=per_cell,
         lineage=lineage,
+        adjudication_audit=adjudication_audit,
     )
 
 

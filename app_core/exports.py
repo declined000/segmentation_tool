@@ -29,6 +29,7 @@ def export_csvs(
     per_frame_csv = None
     per_step_csv = None
     lineage_csv = None
+    adjudication_audit_csv = None
 
     if out_opts.export_tracks_csv:
         tracks_csv = out_dir / "tracks.csv"
@@ -58,6 +59,10 @@ def export_csvs(
         lineage_csv = out_dir / "lineage.csv"
         single.lineage.to_csv(lineage_csv, index=True)
 
+    if out_opts.export_adjudication_audit_csv and single.adjudication_audit is not None and not single.adjudication_audit.empty:
+        adjudication_audit_csv = out_dir / "adjudication_audit.csv"
+        single.adjudication_audit.to_csv(adjudication_audit_csv, index=False)
+
     return ExportedPaths(
         params_json=out_dir / "params.json",
         tracks_csv=tracks_csv,
@@ -65,6 +70,7 @@ def export_csvs(
         per_frame_csv=per_frame_csv,
         per_step_csv=per_step_csv,
         lineage_csv=lineage_csv,
+        adjudication_audit_csv=adjudication_audit_csv,
         masks_tiff=None,
         segmentation_overlay_mp4=None,
         tracking_overlay_mp4=None,

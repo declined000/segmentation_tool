@@ -32,10 +32,14 @@ python3 -m pip install --quiet --upgrade torch torchvision \
     --index-url https://download.pytorch.org/whl/cu124
 
 _TORCH_LIB="$(python3 -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')"
-export LD_LIBRARY_PATH="${_TORCH_LIB}:${LD_LIBRARY_PATH:-}"
+_CBLAS_LIB="$(python3 -c 'import nvidia.cublas.lib, os; print(os.path.dirname(nvidia.cublas.lib.__file__))')"
+_CUDNN_LIB="$(python3 -c 'import nvidia.cudnn.lib, os; print(os.path.dirname(nvidia.cudnn.lib.__file__))')"
+# Important: do NOT append old LD_LIBRARY_PATH here, because some DL VM images
+# include CUDA "stubs" paths that break cublasLt symbol resolution.
+export LD_LIBRARY_PATH="${_TORCH_LIB}:${_CBLAS_LIB}:${_CUDNN_LIB}"
 # Persist for new SSH sessions (idempotent marker)
 if ! grep -q "bioelectricity-torch-lib" ~/.bashrc 2>/dev/null; then
-    echo "export LD_LIBRARY_PATH=\"${_TORCH_LIB}:\${LD_LIBRARY_PATH:-}\"  # bioelectricity-torch-lib" >> ~/.bashrc
+    echo "export LD_LIBRARY_PATH=\"${_TORCH_LIB}:${_CBLAS_LIB}:${_CUDNN_LIB}\"  # bioelectricity-torch-lib" >> ~/.bashrc
 fi
 
 python3 -c "import torch; assert torch.cuda.is_available(), 'CUDA not found'; x=torch.zeros(1, device='cuda'); print(f'PyTorch {torch.__version__}, GPU: {torch.cuda.get_device_name(0)}, cuda tensor OK')"

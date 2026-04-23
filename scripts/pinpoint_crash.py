@@ -10,6 +10,17 @@ print("=" * 60)
 print("  PINPOINT: where does cuBLAS actually crash?")
 print("=" * 60)
 
+# Preload explicit pip CUDA libs first (Linux only), to avoid wrong system
+# libcublasLt resolution on mixed CUDA environments.
+try:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from app_core.cuda_preload import preload_cuda_user_libs
+    loaded = preload_cuda_user_libs(verbose=True)
+    if loaded:
+        print("[preload] CUDA wheel libs loaded")
+except Exception as e:
+    print(f"[preload] skipped ({e})")
+
 # ── Step A: torch matmul (known to work) ─────────────────────
 print("\n[A] torch.matmul ... ", end="", flush=True)
 import torch
@@ -71,7 +82,6 @@ except Exception as e:
 
 # ── Step G: full pipeline import + single frame ──────────────
 print("[G] import app_core.pipeline ... ", end="", flush=True)
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from app_core.pipeline import _run_cellpose_on_stack, _qc_centroids_from_masks
     print("OK")

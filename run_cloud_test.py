@@ -11,17 +11,16 @@ Requires LD_LIBRARY_PATH set before launch (see scripts/gcloud_setup.sh).
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import time
 from pathlib import Path
 
-# Initialize CUDA via the *actually imported* torch BEFORE importing the
-# pipeline (which pulls in skimage, imageio, etc.).  This ensures PyTorch's
-# cuBLAS is loaded first.  We do NOT touch LD_LIBRARY_PATH here — that must
-# be set in the shell before python3 starts.
+# On Linux VMs with mixed CUDA trees, preload pip-packaged cuBLAS/cuDNN first.
 if "--no-gpu" not in sys.argv:
     try:
+        from app_core.cuda_preload import preload_cuda_user_libs
+        preload_cuda_user_libs(verbose=True)
+
         import torch as _torch
 
         if _torch.cuda.is_available():
@@ -60,6 +59,13 @@ def main():
                     help="Force CPU-only (slow, for debugging)")
     ap.add_argument("--sam4ct-path", type=str, default="sam4celltracking",
                     help="Path to cloned sam4celltracking repo")
+    ap.add_argument(
+        "--adjudication-provider",
+        type=str,
+        choices=["gemini", "heuristic"],
+        default="heuristic",
+        help="Phase-1 ambiguity adjudication backend.",
+    )
     args = ap.parse_args()
 
     if not args.tif.exists():
@@ -83,7 +89,10 @@ def main():
                              flow_threshold=0.4, use_gpu=use_gpu)
     qc = QcParams(min_area_px=50, max_area_px=15000, border_px=8,
                   min_solidity=0.50, min_eccentricity=0.0, max_circularity=0.99)
-    tr = TrackingParams(sam4ct_path=args.sam4ct_path)
+    tr = TrackingParams(
+        sam4ct_path=args.sam4ct_path,
+        adjudication_provider=args.adjudication_provider,
+    )
     out_opts = OutputOptions(export_masks_tiff=True)
 
     out_dir = Path("results_cloud") / args.tif.stem
@@ -111,6 +120,10 @@ def main():
     if not res.lineage.empty and "n_children" in res.lineage.columns:
         n_div = int((res.lineage["n_children"] >= 2).sum())
         print(f"  Divisions:   {n_div}")
+    if res.adjudication_audit is not None and not res.adjudication_audit.empty:
+        n_events = int(len(res.adjudication_audit))
+        n_applied = int(res.adjudication_audit["applied"].sum()) if "applied" in res.adjudication_audit.columns else 0
+        print(f"  Adjudicated events: {n_events} (applied: {n_applied})")
 
     print(f"\nExporting to {out_dir} ...")
     exported = export_csvs(out_dir, meta=meta, single=res, out_opts=out_opts)

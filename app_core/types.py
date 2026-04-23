@@ -55,6 +55,17 @@ class TrackingParams:
     sam2_neighbor_dist: int = 30    # max pixels to link mask to prediction
     sam4ct_path: str = "sam4celltracking"  # path to cloned repo
 
+    # Phase 1 adjudication (kept simple for users; defaults are enabled)
+    adjudication_enabled: bool = True
+    adjudication_provider: str = "heuristic"  # gemini|heuristic
+    adjudication_model: str = "gemini-2.5-flash"
+    adjudication_confidence_min: float = 0.55
+    adjudication_radius_px: int = 40
+    adjudication_gap_frames: int = 2
+    adjudication_context_half_window: int = 2  # t-2..t+2
+    adjudication_max_events: int = 200
+    adjudication_crop_size_px: int = 192
+
 
 @dataclass(frozen=True)
 class OutputOptions:
@@ -66,6 +77,7 @@ class OutputOptions:
     export_segmentation_overlay_mp4: bool = True
     export_tracking_overlay_mp4: bool = True
     export_per_step_velocity_csv: bool = False
+    export_adjudication_audit_csv: bool = True
 
 
 @dataclass(frozen=True)
@@ -85,6 +97,7 @@ class SingleRunResult:
     per_frame: pd.DataFrame
     per_cell: pd.DataFrame
     lineage: pd.DataFrame
+    adjudication_audit: pd.DataFrame | None = None
 
 
 @dataclass(frozen=True)
@@ -115,6 +128,7 @@ class ExportedPaths:
     per_frame_csv: Path | None
     per_step_csv: Path | None
     lineage_csv: Path | None
+    adjudication_audit_csv: Path | None
     masks_tiff: Path | None
     segmentation_overlay_mp4: Path | None
     tracking_overlay_mp4: Path | None
@@ -128,6 +142,7 @@ def exported_with(paths: ExportedPaths, **updates) -> ExportedPaths:
         "per_frame_csv": paths.per_frame_csv,
         "per_step_csv": paths.per_step_csv,
         "lineage_csv": paths.lineage_csv,
+        "adjudication_audit_csv": paths.adjudication_audit_csv,
         "masks_tiff": paths.masks_tiff,
         "segmentation_overlay_mp4": paths.segmentation_overlay_mp4,
         "tracking_overlay_mp4": paths.tracking_overlay_mp4,
