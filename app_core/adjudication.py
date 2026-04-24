@@ -255,15 +255,19 @@ def _adjudicate_gemini(e: AmbiguousEvent, crops_b64: list[str], tr: TrackingPara
     model = tr.adjudication_model or "gemini-2.5-flash"
     endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     schema_prompt = (
-        "You are adjudicating ambiguous microscopy tracking events. "
-        "Return JSON only with fields: decision, confidence, reason. "
+        "You are adjudicating ambiguous microscopy cell-tracking events from a short temporal clip. "
+        "Return strict JSON only with fields: decision, confidence, reason. "
         "decision must be one of: continue_same_track, true_new_cell, true_division, merge_or_touch_no_new_id. "
+        "confidence must be a float in [0,1], where >=0.80 means strong visual evidence and <=0.50 means uncertain. "
         f"event_type={e.event_type}; frame={e.frame}; parent_candidate={e.parent_candidate}; "
         f"new_particles={e.new_particles}; min_dist_px={e.min_dist_px}; n_neighbors={e.n_neighbors}. "
-        "Prioritize identity continuity in touching/crowded scenes unless evidence for true division/new-cell is strong."
+        "Use temporal continuity across the sequence: if morphology and centroid continuity suggest the same cell, "
+        "favor continue_same_track or merge_or_touch_no_new_id. "
+        "Use true_division only when a plausible parent-to-two-daughters transition is visible across frames, "
+        "not just transient touching/overlap in one frame. Keep reason concise."
     )
     parts: list[dict[str, Any]] = [{"text": schema_prompt}]
-    for b64 in crops_b64[:5]:
+    for b64 in crops_b64[:9]:
         parts.append({"inline_data": {"mime_type": "image/jpeg", "data": b64}})
 
     payload = {
@@ -310,8 +314,9 @@ def _apply_decision(
 ) -> tuple[pd.DataFrame, str, bool]:
     conf = float(decision.get("confidence", 0.0))
     d = str(decision.get("decision", "defer"))
-    if conf < float(tr.adjudication_confidence_min):
-        return tracks, "keep_original_low_confidence", False
+    min_conf = float(tr.adjudication_confidence_min)
+    if conf < min_conf:
+        return tracks, f"rejected_low_confidence_{conf:.2f}_lt_{min_conf:.2f}", False
 
     out = tracks.copy()
     if d in {"continue_same_track", "merge_or_touch_no_new_id"}:

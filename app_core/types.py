@@ -59,12 +59,12 @@ class TrackingParams:
     adjudication_enabled: bool = True
     adjudication_provider: str = "heuristic"  # gemini|heuristic
     adjudication_model: str = "gemini-2.5-flash"
-    adjudication_confidence_min: float = 0.55
+    adjudication_confidence_min: float = 0.40
     adjudication_radius_px: int = 40
     adjudication_gap_frames: int = 2
-    adjudication_context_half_window: int = 2  # t-2..t+2
+    adjudication_context_half_window: int = 4  # t-4..t+4
     adjudication_max_events: int = 200
-    adjudication_crop_size_px: int = 192
+    adjudication_crop_size_px: int = 256
 
 
 @dataclass(frozen=True)
