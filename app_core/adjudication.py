@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import time
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
@@ -234,7 +235,8 @@ def _adjudicate_event(e: AmbiguousEvent, crops_b64: list[str], tr: TrackingParam
         out = _adjudicate_gemini(e, crops_b64, tr)
         if out is not None:
             return out
-        return {"provider": "gemini", "decision": "defer", "confidence": 0.0, "reason": "gemini_unavailable"}
+        # Defensive fallback if helper returns None unexpectedly.
+        return {"provider": "gemini", "decision": "defer", "confidence": 0.0, "reason": "gemini_unavailable_unknown"}
     return _adjudicate_heuristic(e)
 
 
@@ -251,7 +253,7 @@ def _adjudicate_heuristic(e: AmbiguousEvent) -> dict[str, Any]:
 def _adjudicate_gemini(e: AmbiguousEvent, crops_b64: list[str], tr: TrackingParams) -> dict[str, Any] | None:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
-        return None
+        return {"provider": "gemini", "decision": "defer", "confidence": 0.0, "reason": "gemini_unavailable_missing_api_key"}
     model = tr.adjudication_model or "gemini-2.5-flash"
     endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     schema_prompt = (
@@ -274,27 +276,52 @@ def _adjudicate_gemini(e: AmbiguousEvent, crops_b64: list[str], tr: TrackingPara
         "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json"},
         "contents": [{"role": "user", "parts": parts}],
     }
-    req = urllib.request.Request(
-        endpoint,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            resp = json.loads(r.read().decode("utf-8"))
-    except Exception:
-        return None
+    retries = max(0, int(getattr(tr, "adjudication_gemini_retries", 2)))
+    timeout_s = max(5, int(getattr(tr, "adjudication_gemini_timeout_s", 30)))
+    last_err = "unknown"
+    resp: dict[str, Any] | None = None
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_s) as r:
+                resp = json.loads(r.read().decode("utf-8"))
+            break
+        except Exception as ex:
+            last_err = type(ex).__name__
+            if attempt < retries:
+                time.sleep(0.6 * (attempt + 1))
+    if resp is None:
+        return {
+            "provider": "gemini",
+            "decision": "defer",
+            "confidence": 0.0,
+            "reason": f"gemini_unavailable_request_failed_{last_err}",
+        }
 
     text = ""
     try:
         text = resp["candidates"][0]["content"]["parts"][0]["text"]
     except Exception:
-        return None
+        return {
+            "provider": "gemini",
+            "decision": "defer",
+            "confidence": 0.0,
+            "reason": "gemini_unavailable_malformed_response",
+        }
     try:
         obj = json.loads(text)
     except Exception:
-        return None
+        return {
+            "provider": "gemini",
+            "decision": "defer",
+            "confidence": 0.0,
+            "reason": "gemini_unavailable_non_json_response",
+        }
     d = str(obj.get("decision", "defer"))
     if d not in {"continue_same_track", "true_new_cell", "true_division", "merge_or_touch_no_new_id"}:
         d = "defer"
@@ -339,6 +366,19 @@ def _apply_decision(
             return tracks, "invalid_division_payload", False
         parent = int(e.parent_candidate)
         kids = [int(k) for k in e.new_particles[:2]]
+        if kids[0] == kids[1]:
+            return tracks, "invalid_division_payload_duplicate_children", False
+        if parent in kids:
+            return tracks, "invalid_division_payload_parent_equals_child", False
+        particles_present = set(int(x) for x in out["particle"].dropna().unique().tolist())
+        missing_kids = [k for k in kids if k not in particles_present]
+        if missing_kids:
+            return tracks, f"invalid_division_payload_missing_children_{'_'.join(str(x) for x in missing_kids)}", False
+        # Require both children to start at/after event frame to avoid retroactive links.
+        starts = out.groupby("particle", as_index=False)["frame"].min().rename(columns={"frame": "start_frame"})
+        starts_map = {int(r["particle"]): int(r["start_frame"]) for _, r in starts.iterrows()}
+        if any(starts_map.get(k, -10**9) < int(e.frame) for k in kids):
+            return tracks, "invalid_division_payload_children_start_before_event", False
         if "parent" in out.columns:
             out.loc[out["particle"].isin(kids), "parent"] = parent
         if "fate" in out.columns:
@@ -348,7 +388,9 @@ def _apply_decision(
     if d == "true_new_cell":
         return tracks, "kept_true_new_cell", False
 
-    return tracks, "no_change", False
+    if d == "defer":
+        return tracks, "rejected_defer", False
+    return tracks, f"rejected_unknown_decision_{d}", False
 
 
 def _recompute_generation_and_fate(tracks: pd.DataFrame) -> pd.DataFrame:
