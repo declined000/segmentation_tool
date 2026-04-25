@@ -144,6 +144,22 @@ def main():
         n_events = int(len(res.adjudication_audit))
         n_applied = int(res.adjudication_audit["applied"].sum()) if "applied" in res.adjudication_audit.columns else 0
         print(f"  Adjudicated events: {n_events} (applied: {n_applied})")
+        if "final_applied_action" in res.adjudication_audit.columns:
+            top_actions = (
+                res.adjudication_audit["final_applied_action"]
+                .value_counts()
+                .head(5)
+                .to_dict()
+            )
+            print(f"  Adjudication actions (top): {top_actions}")
+        if "reason" in res.adjudication_audit.columns:
+            n_unavail = int(
+                res.adjudication_audit["reason"]
+                .astype(str)
+                .str.startswith("gemini_unavailable_")
+                .sum()
+            )
+            print(f"  Gemini unavailable events: {n_unavail}")
 
     print(f"\nExporting to {out_dir} ...")
     exported = export_csvs(out_dir, meta=meta, single=res, out_opts=out_opts)
@@ -155,6 +171,31 @@ def main():
             out_dir, args.tif, res.masks_filt, res.pts, res.tracks,
             ef_on_frame=None,
         )
+
+    quality_summary = {
+        "frames": int(res.masks_filt.shape[0]),
+        "detections": int(len(res.pts)),
+        "tracks": int(res.tracks["particle"].nunique()) if not res.tracks.empty else 0,
+        "divisions_ge2_children": int((res.lineage["n_children"] >= 2).sum())
+        if (not res.lineage.empty and "n_children" in res.lineage.columns) else 0,
+    }
+    if res.adjudication_audit is not None and not res.adjudication_audit.empty:
+        aa = res.adjudication_audit
+        quality_summary["adjudication_events"] = int(len(aa))
+        quality_summary["adjudication_applied"] = int(aa["applied"].sum()) if "applied" in aa.columns else 0
+        quality_summary["adjudication_apply_rate"] = (
+            float(aa["applied"].mean()) if "applied" in aa.columns else 0.0
+        )
+        if "provider" in aa.columns:
+            quality_summary["providers"] = aa["provider"].value_counts().to_dict()
+        if "vlm_decision" in aa.columns:
+            quality_summary["vlm_decisions"] = aa["vlm_decision"].value_counts().to_dict()
+        if "final_applied_action" in aa.columns:
+            quality_summary["final_actions"] = aa["final_applied_action"].value_counts().to_dict()
+        if "reason" in aa.columns:
+            rs = aa["reason"].astype(str)
+            quality_summary["gemini_unavailable_events"] = int(rs.str.startswith("gemini_unavailable_").sum())
+    (out_dir / "quality_summary.json").write_text(json.dumps(quality_summary, indent=2), encoding="utf-8")
 
     print(f"\nDone. Results in: {out_dir.resolve()}")
     for f in sorted(out_dir.iterdir()):

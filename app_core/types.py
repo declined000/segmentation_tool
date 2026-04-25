@@ -59,11 +59,17 @@ class TrackingParams:
     adjudication_enabled: bool = True
     adjudication_provider: str = "heuristic"  # gemini|heuristic
     adjudication_model: str = "gemini-2.5-flash"
+    adjudication_enable_gemini_fallback_heuristic: bool = True
     adjudication_gemini_retries: int = 2
     adjudication_gemini_timeout_s: int = 30
     adjudication_confidence_min: float = 0.40
     adjudication_radius_px: int = 40
+    adjudication_consistency_radius_multiplier: float = 1.30
     adjudication_gap_frames: int = 2
+    adjudication_auto_min_persist_frames: int = 2
+    adjudication_auto_max_min_persist_frames: int = 6
+    adjudication_division_persistence_frames: int = 2
+    adjudication_division_min_parent_track_len: int = 6
     adjudication_context_half_window: int = 4  # t-4..t+4
     adjudication_max_events: int = 200
     adjudication_crop_size_px: int = 256
