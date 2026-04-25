@@ -286,16 +286,6 @@ def _adjudicate_event(e: AmbiguousEvent, crops_b64: list[str], tr: TrackingParam
     if provider == "gemini":
         out = _adjudicate_gemini(e, crops_b64, tr)
         if out is not None:
-            reason = str(out.get("reason", ""))
-            if (
-                str(out.get("provider", "")) == "gemini"
-                and reason.startswith("gemini_unavailable_")
-                and bool(tr.adjudication_enable_gemini_fallback_heuristic)
-            ):
-                h = _adjudicate_heuristic(e)
-                h["provider"] = "heuristic_fallback"
-                h["reason"] = f"{h.get('reason', '')} | fallback_from:{reason}"
-                return h
             return out
         # Defensive fallback if helper returns None unexpectedly.
         return {"provider": "gemini", "decision": "defer", "confidence": 0.0, "reason": "gemini_unavailable_unknown"}

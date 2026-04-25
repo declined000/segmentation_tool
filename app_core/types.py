@@ -59,7 +59,6 @@ class TrackingParams:
     adjudication_enabled: bool = True
     adjudication_provider: str = "heuristic"  # gemini|heuristic
     adjudication_model: str = "gemini-2.5-flash"
-    adjudication_enable_gemini_fallback_heuristic: bool = True
     adjudication_gemini_retries: int = 2
     adjudication_gemini_timeout_s: int = 30
     adjudication_confidence_min: float = 0.40
