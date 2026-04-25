@@ -68,6 +68,12 @@ def main():
         default="heuristic",
         help="Phase-1 ambiguity adjudication backend.",
     )
+    ap.add_argument(
+        "--adjudication-model",
+        type=str,
+        default="gemini-2.5-flash",
+        help="Gemini model id used when --adjudication-provider gemini.",
+    )
     args = ap.parse_args()
 
     if not args.tif.exists():
@@ -94,6 +100,7 @@ def main():
     tr = TrackingParams(
         sam4ct_path=args.sam4ct_path,
         adjudication_provider=args.adjudication_provider,
+        adjudication_model=args.adjudication_model,
     )
     out_opts = OutputOptions(export_masks_tiff=True)
 
@@ -122,6 +129,7 @@ def main():
     print(f"  Pipeline: cpsam segmentation + SAM2 tracking")
     print(f"  Input:    {args.tif.name}")
     print(f"  GPU:      {use_gpu}")
+    print(f"  Adjudication: {args.adjudication_provider} ({args.adjudication_model})")
     print(f"  Output:   {out_dir.resolve()}")
     print(f"{'='*60}\n")
 

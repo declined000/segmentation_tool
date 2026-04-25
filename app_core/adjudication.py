@@ -320,7 +320,9 @@ def _adjudicate_gemini(e: AmbiguousEvent, crops_b64: list[str], tr: TrackingPara
         "Use temporal continuity across the sequence: if morphology and centroid continuity suggest the same cell, "
         "favor continue_same_track or merge_or_touch_no_new_id. "
         "Use true_division only when a plausible parent-to-two-daughters transition is visible across frames, "
-        "both daughters persist, and timing is consistent. Keep reason concise."
+        "both daughters persist, and timing is consistent. "
+        "Do NOT call true_division when the parent remains large/unchanged with only contact-direction changes in crowded regions. "
+        "Keep reason concise."
     )
     parts: list[dict[str, Any]] = [{"text": schema_prompt}]
     for b64 in crops_b64[:9]:
@@ -463,6 +465,20 @@ def _apply_decision(
                 return tracks, f"invalid_division_payload_child_far_{k}_{dpk:.1f}", False
         if abs(int(starts_map.get(kids[0], 0)) - int(starts_map.get(kids[1], 0))) > 1:
             return tracks, "invalid_division_payload_children_desync", False
+        # Crowded scenes with moderate confidence often induce false-positive divisions.
+        if int(e.n_neighbors) >= 4 and conf < 0.90:
+            return tracks, "rejected_division_crowded_low_confidence", False
+        # Biological guard: when parent stays large and daughters are not meaningfully smaller,
+        # avoid forcing a split label.
+        if "area" in out.columns:
+            p_area = float(pstat.get("end_area", np.nan))
+            c1_area = float(stats.get(kids[0], {}).get("start_area", np.nan))
+            c2_area = float(stats.get(kids[1], {}).get("start_area", np.nan))
+            if np.isfinite(p_area) and np.isfinite(c1_area) and np.isfinite(c2_area) and p_area > 0:
+                if c1_area >= 0.90 * p_area and c2_area >= 0.90 * p_area:
+                    return tracks, "rejected_division_children_not_smaller_than_parent", False
+                if (c1_area + c2_area) > 1.80 * p_area:
+                    return tracks, "rejected_division_children_area_sum_too_large", False
         if "parent" in out.columns:
             out.loc[out["particle"].isin(kids), "parent"] = parent
         if "fate" in out.columns:
@@ -485,7 +501,19 @@ def _track_stats_map(tracks: pd.DataFrame) -> dict[int, dict[str, float | int]]:
     last = tracks.sort_values("frame").groupby("particle", as_index=False).last()[["particle", "frame", "x", "y"]]
     last = last.rename(columns={"frame": "end_frame", "x": "end_x", "y": "end_y"})
     spans = tracks.groupby("particle", as_index=False)["frame"].agg(track_len="count")
-    merged = first.merge(last, on="particle", how="inner").merge(spans, on="particle", how="left")
+    if "area" in tracks.columns:
+        first_a = tracks.sort_values("frame").groupby("particle", as_index=False).first()[["particle", "area"]]
+        first_a = first_a.rename(columns={"area": "start_area"})
+        last_a = tracks.sort_values("frame").groupby("particle", as_index=False).last()[["particle", "area"]]
+        last_a = last_a.rename(columns={"area": "end_area"})
+        merged = (
+            first.merge(last, on="particle", how="inner")
+            .merge(spans, on="particle", how="left")
+            .merge(first_a, on="particle", how="left")
+            .merge(last_a, on="particle", how="left")
+        )
+    else:
+        merged = first.merge(last, on="particle", how="inner").merge(spans, on="particle", how="left")
     out: dict[int, dict[str, float | int]] = {}
     for _, r in merged.iterrows():
         pid = int(r["particle"])
@@ -497,6 +525,8 @@ def _track_stats_map(tracks: pd.DataFrame) -> dict[int, dict[str, float | int]]:
             "end_x": float(r["end_x"]),
             "end_y": float(r["end_y"]),
             "track_len": int(r["track_len"]),
+            "start_area": float(r["start_area"]) if "start_area" in r and pd.notna(r["start_area"]) else float("nan"),
+            "end_area": float(r["end_area"]) if "end_area" in r and pd.notna(r["end_area"]) else float("nan"),
         }
     return out
 
