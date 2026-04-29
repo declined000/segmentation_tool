@@ -70,6 +70,7 @@ def run_phase1_adjudication(
                 "n_neighbors": e.n_neighbors,
                 "provider": decision.get("provider"),
                 "vlm_decision": decision.get("decision"),
+                "selected_hypothesis": decision.get("hypothesis"),
                 "confidence": float(decision.get("confidence", 0.0)),
                 "reason": decision.get("reason", ""),
                 "final_applied_action": final_action,
@@ -309,9 +310,11 @@ def _adjudicate_gemini(e: AmbiguousEvent, crops_b64: list[str], tr: TrackingPara
         return {"provider": "gemini", "decision": "defer", "confidence": 0.0, "reason": "gemini_unavailable_missing_api_key"}
     model = tr.adjudication_model or "gemini-2.5-flash"
     endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    hypotheses = _hypotheses_for_event(e)
     schema_prompt = (
         "You are adjudicating ambiguous microscopy cell-tracking events from a short temporal clip. "
-        "Return strict JSON only with fields: decision, confidence, reason. "
+        "Return strict JSON only with fields: hypothesis, decision, confidence, reason. "
+        f"Choose exactly one hypothesis from this list: {hypotheses}. "
         "decision must be one of: continue_same_track, true_new_cell, true_division, merge_or_touch_no_new_id. "
         "confidence must be a float in [0,1], where >=0.80 means strong visual evidence and <=0.50 means uncertain. "
         f"event_type={e.event_type}; frame={e.frame}; parent_candidate={e.parent_candidate}; "
@@ -319,6 +322,9 @@ def _adjudicate_gemini(e: AmbiguousEvent, crops_b64: list[str], tr: TrackingPara
         f"parent_track_len={e.parent_track_len}; child_track_lens={e.child_track_lens}. "
         "Use temporal continuity across the sequence: if morphology and centroid continuity suggest the same cell, "
         "favor continue_same_track or merge_or_touch_no_new_id. "
+        "For crowded contact/bump events, compare the hypotheses using before-contact, during-contact, and after-contact frames. "
+        "Prefer contact_same_identity or fragment_reconnect over true_division when cells merely touch, bump, change direction, "
+        "or temporarily merge at the boundary. "
         "Use true_division only when a plausible parent-to-two-daughters transition is visible across frames, "
         "both daughters persist, and timing is consistent. "
         "Do NOT call true_division when the parent remains large/unchanged with only contact-direction changes in crowded regions. "
@@ -378,15 +384,61 @@ def _adjudicate_gemini(e: AmbiguousEvent, crops_b64: list[str], tr: TrackingPara
             "confidence": 0.0,
             "reason": "gemini_unavailable_non_json_response",
         }
+    h = str(obj.get("hypothesis", "")).strip()
+    if h not in hypotheses:
+        h = "unspecified"
     d = str(obj.get("decision", "defer"))
+    d = _decision_from_hypothesis(h, d)
     if d not in {"continue_same_track", "true_new_cell", "true_division", "merge_or_touch_no_new_id"}:
         d = "defer"
     return {
         "provider": "gemini",
+        "hypothesis": h,
         "decision": d,
         "confidence": float(obj.get("confidence", 0.0)),
         "reason": str(obj.get("reason", ""))[:500],
     }
+
+
+def _hypotheses_for_event(e: AmbiguousEvent) -> list[str]:
+    if e.event_type == "potential_division":
+        base = [
+            "true_division_after_separation",
+            "contact_same_identity_no_division",
+            "contact_id_swap_after_bump",
+            "fragment_reconnect_same_cell",
+            "defer_uncertain",
+        ]
+    elif e.event_type in {"cluster_overlap_id_change", "new_near_endpoint"} or int(e.n_neighbors) >= 3:
+        base = [
+            "contact_same_identity_no_division",
+            "contact_id_swap_after_bump",
+            "fragment_reconnect_same_cell",
+            "true_new_cell",
+            "defer_uncertain",
+        ]
+    else:
+        base = [
+            "fragment_reconnect_same_cell",
+            "true_new_cell",
+            "true_division_after_separation",
+            "defer_uncertain",
+        ]
+    return base
+
+
+def _decision_from_hypothesis(hypothesis: str, model_decision: str) -> str:
+    if hypothesis == "true_division_after_separation":
+        return "true_division"
+    if hypothesis == "fragment_reconnect_same_cell":
+        return "continue_same_track"
+    if hypothesis == "contact_same_identity_no_division":
+        return "merge_or_touch_no_new_id"
+    if hypothesis == "true_new_cell":
+        return "true_new_cell"
+    if hypothesis in {"contact_id_swap_after_bump", "defer_uncertain"}:
+        return "defer"
+    return model_decision
 
 
 def _apply_decision(
