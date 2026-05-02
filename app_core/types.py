@@ -72,6 +72,12 @@ class TrackingParams:
     adjudication_context_half_window: int = 4  # t-4..t+4
     adjudication_max_events: int = 200
     adjudication_crop_size_px: int = 256
+    # Option A: track-only post-window verification (disabled by default)
+    adjudication_postverify_enabled: bool = False
+    adjudication_postverify_frames: int = 3
+    adjudication_postverify_min_presence_ratio: float = 0.67
+    adjudication_postverify_min_child_separation_px: float = 6.0
+    adjudication_postverify_continue_max_dist_multiplier: float = 1.35
 
 
 @dataclass(frozen=True)

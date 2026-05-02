@@ -74,6 +74,35 @@ def main():
         default="gemini-2.5-flash",
         help="Gemini model id used when --adjudication-provider gemini.",
     )
+    ap.add_argument(
+        "--adjudication-postverify",
+        action="store_true",
+        help="Enable Option A post-window track verification for continue/division decisions.",
+    )
+    ap.add_argument(
+        "--adjudication-postverify-frames",
+        type=int,
+        default=3,
+        help="Future-frame window size for post-verification (Option A).",
+    )
+    ap.add_argument(
+        "--adjudication-postverify-min-presence-ratio",
+        type=float,
+        default=0.67,
+        help="Required presence ratio in the post-window (Option A).",
+    )
+    ap.add_argument(
+        "--adjudication-postverify-min-child-separation-px",
+        type=float,
+        default=6.0,
+        help="Minimum median daughter separation in post-window for true_division (Option A).",
+    )
+    ap.add_argument(
+        "--adjudication-postverify-continue-max-dist-multiplier",
+        type=float,
+        default=1.35,
+        help="Tolerance multiplier for continue motion projection in post-window (Option A).",
+    )
     args = ap.parse_args()
 
     if not args.tif.exists():
@@ -101,6 +130,11 @@ def main():
         sam4ct_path=args.sam4ct_path,
         adjudication_provider=args.adjudication_provider,
         adjudication_model=args.adjudication_model,
+        adjudication_postverify_enabled=args.adjudication_postverify,
+        adjudication_postverify_frames=max(0, int(args.adjudication_postverify_frames)),
+        adjudication_postverify_min_presence_ratio=float(args.adjudication_postverify_min_presence_ratio),
+        adjudication_postverify_min_child_separation_px=float(args.adjudication_postverify_min_child_separation_px),
+        adjudication_postverify_continue_max_dist_multiplier=float(args.adjudication_postverify_continue_max_dist_multiplier),
     )
     out_opts = OutputOptions(export_masks_tiff=True)
 

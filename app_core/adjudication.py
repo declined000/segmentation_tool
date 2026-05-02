@@ -476,6 +476,9 @@ def _apply_decision(
         dist = float(np.hypot(float(cstat["start_x"]) - float(pstat["end_x"]), float(cstat["start_y"]) - float(pstat["end_y"])))
         if dist > radius_limit:
             return tracks, f"rejected_continue_distance_{dist:.1f}_gt_{radius_limit:.1f}", False
+        post_reason = _postverify_continue_track(out, parent=parent, child=child, event_frame=int(e.frame), radius_limit=radius_limit, tr=tr)
+        if post_reason is not None:
+            return tracks, post_reason, False
         out.loc[idx, "particle"] = parent
         # Continuation should not keep parent link for merged segment rows.
         if "parent" in out.columns:
@@ -531,6 +534,9 @@ def _apply_decision(
                     return tracks, "rejected_division_children_not_smaller_than_parent", False
                 if (c1_area + c2_area) > 1.80 * p_area:
                     return tracks, "rejected_division_children_area_sum_too_large", False
+        post_reason = _postverify_division_track(out, kids=kids, event_frame=int(e.frame), tr=tr)
+        if post_reason is not None:
+            return tracks, post_reason, False
         if "parent" in out.columns:
             out.loc[out["particle"].isin(kids), "parent"] = parent
         if "fate" in out.columns:
@@ -543,6 +549,88 @@ def _apply_decision(
     if d == "defer":
         return tracks, "rejected_defer", False
     return tracks, f"rejected_unknown_decision_{d}", False
+
+
+def _postverify_continue_track(
+    tracks: pd.DataFrame,
+    parent: int,
+    child: int,
+    event_frame: int,
+    radius_limit: float,
+    tr: TrackingParams,
+) -> str | None:
+    if not bool(getattr(tr, "adjudication_postverify_enabled", False)):
+        return None
+    w = max(0, int(getattr(tr, "adjudication_postverify_frames", 0)))
+    if w <= 0:
+        return None
+    ratio = float(np.clip(float(getattr(tr, "adjudication_postverify_min_presence_ratio", 0.67)), 0.20, 1.0))
+    child_df = tracks[(tracks["particle"] == child) & (tracks["frame"] >= event_frame) & (tracks["frame"] <= (event_frame + w))].sort_values("frame")
+    expected = w + 1
+    req = max(2, int(np.ceil(expected * ratio)))
+    if len(child_df) < req:
+        return f"rejected_continue_postwindow_presence_{len(child_df)}_lt_{req}"
+
+    parent_hist = tracks[(tracks["particle"] == parent) & (tracks["frame"] <= event_frame)].sort_values("frame").tail(2)
+    if len(parent_hist) < 2:
+        # If parent history is too short, do not block the decision on motion projection alone.
+        return None
+
+    p_prev = parent_hist.iloc[0]
+    p_last = parent_hist.iloc[1]
+    base_frame = int(p_last["frame"])
+    vx = float(p_last["x"]) - float(p_prev["x"])
+    vy = float(p_last["y"]) - float(p_prev["y"])
+    dist_mult = float(getattr(tr, "adjudication_postverify_continue_max_dist_multiplier", 1.35))
+    tol = radius_limit * max(1.0, dist_mult)
+    good = 0
+    for _, r in child_df.iterrows():
+        dt = max(1, int(r["frame"]) - base_frame)
+        pred_x = float(p_last["x"]) + vx * dt
+        pred_y = float(p_last["y"]) + vy * dt
+        dd = float(np.hypot(float(r["x"]) - pred_x, float(r["y"]) - pred_y))
+        if dd <= tol:
+            good += 1
+    req_good = max(2, int(np.ceil(len(child_df) * ratio)))
+    if good < req_good:
+        return f"rejected_continue_postwindow_motion_{good}_lt_{req_good}"
+    return None
+
+
+def _postverify_division_track(
+    tracks: pd.DataFrame,
+    kids: list[int],
+    event_frame: int,
+    tr: TrackingParams,
+) -> str | None:
+    if not bool(getattr(tr, "adjudication_postverify_enabled", False)):
+        return None
+    w = max(0, int(getattr(tr, "adjudication_postverify_frames", 0)))
+    if w <= 0:
+        return None
+    ratio = float(np.clip(float(getattr(tr, "adjudication_postverify_min_presence_ratio", 0.67)), 0.20, 1.0))
+    min_sep = float(getattr(tr, "adjudication_postverify_min_child_separation_px", 6.0))
+    fmax = event_frame + w
+    expected = w + 1
+    req = max(2, int(np.ceil(expected * ratio)))
+
+    k1 = tracks[(tracks["particle"] == int(kids[0])) & (tracks["frame"] >= event_frame) & (tracks["frame"] <= fmax)][["frame", "x", "y"]].sort_values("frame")
+    k2 = tracks[(tracks["particle"] == int(kids[1])) & (tracks["frame"] >= event_frame) & (tracks["frame"] <= fmax)][["frame", "x", "y"]].sort_values("frame")
+    if len(k1) < req:
+        return f"rejected_division_postwindow_presence_{int(kids[0])}_{len(k1)}_lt_{req}"
+    if len(k2) < req:
+        return f"rejected_division_postwindow_presence_{int(kids[1])}_{len(k2)}_lt_{req}"
+
+    common = k1.merge(k2, on="frame", suffixes=("_1", "_2"))
+    req_common = max(2, int(np.ceil(req * 0.8)))
+    if len(common) < req_common:
+        return f"rejected_division_postwindow_common_frames_{len(common)}_lt_{req_common}"
+    sep = np.hypot(common["x_1"] - common["x_2"], common["y_1"] - common["y_2"]).to_numpy(dtype=float)
+    if sep.size == 0:
+        return "rejected_division_postwindow_no_separation_samples"
+    if float(np.median(sep)) < min_sep:
+        return f"rejected_division_postwindow_median_sep_{float(np.median(sep)):.1f}_lt_{min_sep:.1f}"
+    return None
 
 
 def _track_stats_map(tracks: pd.DataFrame) -> dict[int, dict[str, float | int]]:
