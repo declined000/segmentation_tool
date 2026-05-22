@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import platform
 import sys
 import time
 from pathlib import Path
@@ -88,7 +90,30 @@ def main():
                 print("WARNING: --no-gpu not set but CUDA unavailable. Falling back to CPU.")
                 use_gpu = False
             else:
+                # Functional smoke test catches cuBLAS symbol/link issues early.
+                # If this fails, running the full pipeline often crashes the process.
+                x = torch.randn(2, 2, device="cuda")
+                _ = x @ x
                 print(f"GPU: {torch.cuda.get_device_name(0)}")
+        except Exception as e:
+            print(f"ERROR: GPU preflight failed ({e}).")
+            print("Set LD_LIBRARY_PATH for torch/nvidia libs and retry, or use --no-gpu.")
+            sys.exit(2)
+
+    # Keep downstream libraries in this process consistent with preflight.
+    if use_gpu and platform.system() == "Linux":
+        try:
+            import torch
+            torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+            ld = os.environ.get("LD_LIBRARY_PATH", "")
+            if torch_lib not in ld.split(":"):
+                os.environ["LD_LIBRARY_PATH"] = f"{torch_lib}:{ld}" if ld else torch_lib
+        except Exception:
+            pass
+
+    if use_gpu:
+        try:
+            import torch  # noqa: F401
         except ImportError:
             use_gpu = False
 
