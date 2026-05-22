@@ -72,6 +72,14 @@ class TrackingParams:
     adjudication_context_half_window: int = 4  # t-4..t+4
     adjudication_max_events: int = 200
     adjudication_crop_size_px: int = 256
+    # Option B: mask-aware crowded-event verification (enabled by default)
+    adjudication_mask_check_enabled: bool = True
+    adjudication_mask_check_crowded_neighbors_min: int = 3
+    adjudication_mask_check_frames: int = 3
+    adjudication_mask_check_min_common_frames: int = 2
+    adjudication_mask_check_min_parent_child_overlap: float = 0.10
+    adjudication_mask_check_max_contact_ratio: float = 0.22
+    adjudication_mask_check_min_sep_growth_px: float = 2.0
 
 
 @dataclass(frozen=True)

@@ -55,7 +55,7 @@ def run_phase1_adjudication(
         crops = _make_context_crops(movie, masks_filt, out, e, tr)
         decision = _adjudicate_event(e, crops, tr)
         before = out
-        out, final_action, applied = _apply_decision(out, e, decision, tr)
+        out, final_action, applied = _apply_decision(out, masks_filt, e, decision, tr)
         if applied:
             out = _recompute_generation_and_fate(out)
         audit_rows.append(
@@ -443,6 +443,7 @@ def _decision_from_hypothesis(hypothesis: str, model_decision: str) -> str:
 
 def _apply_decision(
     tracks: pd.DataFrame,
+    masks_filt: np.ndarray,
     e: AmbiguousEvent,
     decision: dict[str, Any],
     tr: TrackingParams,
@@ -476,6 +477,17 @@ def _apply_decision(
         dist = float(np.hypot(float(cstat["start_x"]) - float(pstat["end_x"]), float(cstat["start_y"]) - float(pstat["end_y"])))
         if dist > radius_limit:
             return tracks, f"rejected_continue_distance_{dist:.1f}_gt_{radius_limit:.1f}", False
+        mask_reason = _mask_check_continue_crowded(
+            masks_filt,
+            parent=parent,
+            child=child,
+            parent_end_frame=int(pstat["end_frame"]),
+            child_start_frame=int(cstat["start_frame"]),
+            n_neighbors=int(e.n_neighbors),
+            tr=tr,
+        )
+        if mask_reason is not None:
+            return tracks, mask_reason, False
         out.loc[idx, "particle"] = parent
         # Continuation should not keep parent link for merged segment rows.
         if "parent" in out.columns:
@@ -531,6 +543,20 @@ def _apply_decision(
                     return tracks, "rejected_division_children_not_smaller_than_parent", False
                 if (c1_area + c2_area) > 1.80 * p_area:
                     return tracks, "rejected_division_children_area_sum_too_large", False
+        mask_reason = _mask_check_division_crowded(
+            masks_filt,
+            parent=parent,
+            kids=kids,
+            parent_end_frame=int(pstat["end_frame"]),
+            kid1_start_frame=int(starts_map.get(kids[0], e.frame)),
+            kid2_start_frame=int(starts_map.get(kids[1], e.frame)),
+            event_frame=int(e.frame),
+            n_neighbors=int(e.n_neighbors),
+            confidence=float(conf),
+            tr=tr,
+        )
+        if mask_reason is not None:
+            return tracks, mask_reason, False
         if "parent" in out.columns:
             out.loc[out["particle"].isin(kids), "parent"] = parent
         if "fate" in out.columns:
@@ -543,6 +569,142 @@ def _apply_decision(
     if d == "defer":
         return tracks, "rejected_defer", False
     return tracks, f"rejected_unknown_decision_{d}", False
+
+
+def _mask_check_continue_crowded(
+    masks_filt: np.ndarray,
+    parent: int,
+    child: int,
+    parent_end_frame: int,
+    child_start_frame: int,
+    n_neighbors: int,
+    tr: TrackingParams,
+) -> str | None:
+    if not bool(getattr(tr, "adjudication_mask_check_enabled", True)):
+        return None
+    crowded_min = int(getattr(tr, "adjudication_mask_check_crowded_neighbors_min", 3))
+    if n_neighbors < crowded_min:
+        return None
+    if parent_end_frame < 0 or child_start_frame < 0:
+        return None
+    if parent_end_frame >= int(masks_filt.shape[0]) or child_start_frame >= int(masks_filt.shape[0]):
+        return None
+    min_overlap = float(getattr(tr, "adjudication_mask_check_min_parent_child_overlap", 0.10))
+    overlap = _label_overlap_ratio_with_dilation(
+        masks_filt[parent_end_frame],
+        parent,
+        masks_filt[child_start_frame],
+        child,
+    )
+    if np.isfinite(overlap) and overlap < min_overlap:
+        return f"rejected_continue_mask_overlap_{overlap:.2f}_lt_{min_overlap:.2f}"
+    return None
+
+
+def _mask_check_division_crowded(
+    masks_filt: np.ndarray,
+    parent: int,
+    kids: list[int],
+    parent_end_frame: int,
+    kid1_start_frame: int,
+    kid2_start_frame: int,
+    event_frame: int,
+    n_neighbors: int,
+    confidence: float,
+    tr: TrackingParams,
+) -> str | None:
+    if not bool(getattr(tr, "adjudication_mask_check_enabled", True)):
+        return None
+    crowded_min = int(getattr(tr, "adjudication_mask_check_crowded_neighbors_min", 3))
+    # Keep non-crowded events unchanged; Option B is targeted.
+    if n_neighbors < crowded_min:
+        return None
+    max_t = int(masks_filt.shape[0]) - 1
+    if max_t < 0:
+        return None
+    f0 = max(0, min(event_frame, kid1_start_frame, kid2_start_frame))
+    w = max(1, int(getattr(tr, "adjudication_mask_check_frames", 3)))
+    f1 = min(max_t, f0 + w)
+    min_common = max(1, int(getattr(tr, "adjudication_mask_check_min_common_frames", 2)))
+    max_contact = float(getattr(tr, "adjudication_mask_check_max_contact_ratio", 0.22))
+    min_sep_growth = float(getattr(tr, "adjudication_mask_check_min_sep_growth_px", 2.0))
+    min_parent_overlap = float(getattr(tr, "adjudication_mask_check_min_parent_child_overlap", 0.10))
+
+    # Ensure at least one daughter substantially overlaps the parent endpoint mask.
+    if 0 <= parent_end_frame <= max_t:
+        ov1 = _label_overlap_ratio_with_dilation(masks_filt[parent_end_frame], parent, masks_filt[min(max_t, kid1_start_frame)], int(kids[0]))
+        ov2 = _label_overlap_ratio_with_dilation(masks_filt[parent_end_frame], parent, masks_filt[min(max_t, kid2_start_frame)], int(kids[1]))
+        if np.isfinite(ov1) and np.isfinite(ov2):
+            if max(ov1, ov2) < min_parent_overlap and confidence < 0.92:
+                return f"rejected_division_mask_parent_overlap_{max(ov1, ov2):.2f}_lt_{min_parent_overlap:.2f}"
+
+    dists: list[float] = []
+    contacts: list[float] = []
+    common = 0
+    for t in range(f0, f1 + 1):
+        frame = masks_filt[t]
+        m1 = frame == int(kids[0])
+        m2 = frame == int(kids[1])
+        if (not m1.any()) or (not m2.any()):
+            continue
+        common += 1
+        c1 = _mask_centroid(m1)
+        c2 = _mask_centroid(m2)
+        if c1 is not None and c2 is not None:
+            dists.append(float(np.hypot(c1[0] - c2[0], c1[1] - c2[1])))
+        contacts.append(_mask_contact_ratio(m1, m2))
+
+    if common < min_common:
+        return f"rejected_division_mask_common_frames_{common}_lt_{min_common}"
+    if contacts:
+        mean_contact = float(np.mean(contacts))
+        if mean_contact > max_contact and confidence < 0.92:
+            return f"rejected_division_mask_contact_{mean_contact:.2f}_gt_{max_contact:.2f}"
+    if len(dists) >= 2:
+        if float(dists[-1] - dists[0]) < min_sep_growth and confidence < 0.95:
+            return f"rejected_division_mask_no_sep_growth_{float(dists[-1] - dists[0]):.1f}_lt_{min_sep_growth:.1f}"
+    return None
+
+
+def _label_overlap_ratio_with_dilation(
+    frame_a: np.ndarray,
+    label_a: int,
+    frame_b: np.ndarray,
+    label_b: int,
+) -> float:
+    a = frame_a == int(label_a)
+    b = frame_b == int(label_b)
+    if (not a.any()) or (not b.any()):
+        return float("nan")
+    a_dil = _binary_dilate_8(a)
+    inter = int((a_dil & b).sum())
+    denom = float(max(1, min(int(a.sum()), int(b.sum()))))
+    return float(inter / denom)
+
+
+def _mask_contact_ratio(m1: np.ndarray, m2: np.ndarray) -> float:
+    if (not m1.any()) or (not m2.any()):
+        return 0.0
+    d1 = _binary_dilate_8(m1)
+    touch = int((d1 & m2).sum())
+    denom = float(max(1, min(int(m1.sum()), int(m2.sum()))))
+    return float(touch / denom)
+
+
+def _binary_dilate_8(mask: np.ndarray) -> np.ndarray:
+    p = np.pad(mask.astype(bool), 1, mode="constant", constant_values=False)
+    out = np.zeros_like(mask, dtype=bool)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            out |= p[1 + dy : 1 + dy + mask.shape[0], 1 + dx : 1 + dx + mask.shape[1]]
+    return out
+
+
+def _mask_centroid(mask: np.ndarray) -> tuple[float, float] | None:
+    ys, xs = np.nonzero(mask)
+    if ys.size == 0:
+        return None
+    return float(xs.mean()), float(ys.mean())
 
 
 def _track_stats_map(tracks: pd.DataFrame) -> dict[int, dict[str, float | int]]:
